@@ -181,7 +181,8 @@ button { font-family: inherit; }
   box-shadow: 0 1px 3px rgba(0, 0, 0, .06); transition: .15s;
 }
 .side-toggle:hover { color: var(--primary); border-color: var(--primary); }
-.layout.collapsed { grid-template-columns: 0 minmax(0, 1fr); gap: 0; }
+/* 收起时改为单列：按钮为绝对定位不占格，若保留两列，内容区会落到宽度为 0 的第一列而消失 */
+.layout.collapsed { grid-template-columns: minmax(0, 1fr); gap: 0; }
 .layout.collapsed .side { display: none; }
 .layout.collapsed .side-toggle { left: 6px; }
 .side { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
