@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI 智能试卷模拟系统</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">AI</span>
+        <div>
+          <h1>智能试卷模拟系统</h1>
+          <p>AI 出题 · 在线答题 · 智能评卷 · 错题改错</p>
+        </div>
+      </div>
+      <nav class="tabs">
+        <button class="tab active" data-view="generate">生成试卷</button>
+        <button class="tab" data-view="exam">答题评卷</button>
+        <button class="tab" data-view="mistakes">错题本<em id="mistakeBadge"></em></button>
+      </nav>
+      <div class="topbar-right">
+        <div class="model-pick">
+          <select id="modelPick" title="选择命题 / 评卷使用的模型">
+            <option value="">默认模型</option>
+          </select>
+          <button id="btnRefreshModels" class="ghost small" title="重新拉取可用模型">↻</button>
+        </div>
+        <div class="status" id="status">检测中…</div>
+      </div>
+    </header>
+
+    <main>
+      <!-- 生成试卷 -->
+      <section class="view" id="view-generate">
+        <div class="card">
+          <h2>生成试卷</h2>
+          <p class="hint">按题型配置生成，或上传大纲 / 文档让 AI 依据大纲命题。</p>
+
+          <div class="mode-switch">
+            <button class="mode-btn active" data-mode="spec">按题型配置</button>
+            <button class="mode-btn" data-mode="outline">按大纲 / 文档</button>
+          </div>
+
+          <div class="grid">
+            <label class="field">
+              <span>科目 <b>*</b></span>
+              <input id="subject" list="subjectList" placeholder="如：高中数学" value="高中数学" />
+              <datalist id="subjectList">
+                <option>小学语文</option>
+                <option>初中数学</option>
+                <option>初中英语</option>
+                <option>高中数学</option>
+                <option>高中物理</option>
+                <option>高中化学</option>
+                <option>高中生物</option>
+                <option>高中语文</option>
+                <option>高中英语</option>
+                <option>高中历史</option>
+                <option>大学高等数学</option>
+              </datalist>
+            </label>
+
+            <label class="field">
+              <span>难度</span>
+              <select id="difficulty">
+                <option>简单</option>
+                <option selected>中等</option>
+                <option>较难</option>
+                <option>竞赛</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="field subject-lib">
+            <span>科目库（保存后可直接复用已解析的大纲与真题考点）</span>
+            <div class="actions">
+              <select id="subjectPick" class="grow">
+                <option value="">从科目库选择…</option>
+              </select>
+              <button id="btnSaveSubject" class="ghost">保存 / 更新</button>
+              <button id="btnDeleteSubject" class="ghost danger">删除</button>
+            </div>
+            <div id="subjectInfo" class="analysis hidden"></div>
+          </div>
+
+          <div class="specs">
+            <div class="specs-head">
+              <span>题型</span><span>题量</span><span>每题分值</span>
+            </div>
+            <div id="specRows"></div>
+          </div>
+          <p class="hint" id="specsHint"></p>
+
+          <div id="panel-outline" class="hidden">
+            <label class="field">
+              <span>粘贴大纲 / 知识点 / 题型要求</span>
+              <textarea
+                id="outlineText"
+                rows="7"
+                placeholder="把考试大纲、知识点清单或题型要求直接粘贴进来。例如：&#10;第一章 集合与函数：集合运算、函数单调性…&#10;题型：单选 10 题每题 3 分，填空 5 题每题 3 分…"
+              ></textarea>
+            </label>
+
+            <div class="field">
+              <span>上传大纲文档（可多选）</span>
+              <div id="dropzone" class="dropzone">
+                <input
+                  type="file"
+                  id="outlineFiles"
+                  multiple
+                  accept=".pdf,.docx,.txt,.md,.markdown"
+                  hidden
+                />
+                <div class="dz-main">点击选择文件，或将文件拖到此处</div>
+                <div class="hint">支持 PDF、Word(.docx)、TXT / Markdown，单个文件 ≤ 10MB，最多 8 个</div>
+              </div>
+              <div id="fileList" class="file-list"></div>
+            </div>
+
+            <div class="actions">
+              <button id="btnAnalyzeOutline" class="ghost">AI 分析大纲</button>
+              <span class="hint">识别科目、题型与题量并自动填到上方表单，可再手动调整</span>
+            </div>
+            <div id="analysisResult" class="analysis hidden"></div>
+          </div>
+
+          <div class="field real-exam">
+            <label class="check-line">
+              <input type="checkbox" id="useRealExam" />
+              <span>参考历年真题：命题前先联网检索真题考点，重点按「真题考点 + 大纲范围」分配</span>
+            </label>
+
+            <div id="realExamOpts" class="real-opts hidden">
+              <div class="grid two">
+                <label class="field">
+                  <span>年份范围</span>
+                  <input id="realExamYears" placeholder="如：近 5 年 / 2019-2025" />
+                </label>
+                <label class="field">
+                  <span>真题考点占比（%）</span>
+                  <input id="realExamRatio" type="number" min="10" max="90" step="10" value="50" />
+                </label>
+              </div>
+              <label class="check-line">
+                <input type="checkbox" id="refreshRealExam" />
+                <span>重新联网检索（覆盖科目库中已保存的考点）</span>
+              </label>
+              <div class="actions">
+                <button id="btnRealExam" class="ghost">检索历年真题考点</button>
+                <span class="hint">可先单独检索确认效果；生成时会自动检索一次。检索不到会退化为纯大纲命题。</span>
+              </div>
+            </div>
+
+            <div id="realExamResult" class="analysis hidden"></div>
+          </div>
+
+          <div class="field history-paper">
+            <label class="check-line">
+              <input type="checkbox" id="useHistory" checked />
+              <span>参考历史试卷：与该科目已生成的试卷比对，尽量出不一样的题</span>
+            </label>
+
+            <div id="historyOpts" class="real-opts">
+              <div class="grid two">
+                <label class="field">
+                  <span>新题比例（%）</span>
+                  <input id="historyRatio" type="number" min="10" max="100" step="10" value="40" />
+                </label>
+                <label class="field">
+                  <span>参考最近几份试卷</span>
+                  <input id="historyLimit" type="number" min="1" max="10" step="1" value="5" />
+                </label>
+              </div>
+              <span class="hint">新题比例 = 全卷中与历史试卷不重复的题目占比；其余题目可考同一知识点，但必须换数据 / 换情境 / 换问法。生成后会核对实际新题率并在提示中告知。</span>
+            </div>
+          </div>
+
+          <label class="field">
+            <span>附加要求（可选）</span>
+            <textarea id="notes" rows="3" placeholder="例如：重点考查函数与导数；不要出现超纲内容；简答题需写出关键步骤"></textarea>
+          </label>
+
+          <div class="actions">
+            <button id="btnGenerate" class="primary">生成试卷</button>
+            <span class="total" id="totalInfo"></span>
+          </div>
+        </div>
+
+        <div id="generatedPane"></div>
+      </section>
+
+      <!-- 答题评卷 -->
+      <section class="view hidden" id="view-exam">
+        <div class="layout">
+          <button class="side-toggle" data-side="exam" title="收起侧边栏">«</button>
+          <aside class="card side">
+            <div class="side-head">
+              <h2>科目</h2>
+              <button id="btnRefreshPapers" class="ghost small">刷新</button>
+            </div>
+            <div id="paperSubjectNav" class="subject-nav"></div>
+            <div id="paperList" class="list"></div>
+          </aside>
+          <div class="main-col">
+            <div id="examPane"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 错题本 -->
+      <section class="view hidden" id="view-mistakes">
+        <div class="layout">
+          <button class="side-toggle" data-side="mistakes" title="收起侧边栏">«</button>
+          <aside class="card side">
+            <div class="side-head">
+              <h2>科目</h2>
+              <button id="btnRefreshMistakes" class="ghost small">刷新</button>
+            </div>
+            <div id="mistakeSubjectNav" class="subject-nav"></div>
+          </aside>
+          <div class="main-col">
+            <div class="card">
+              <div class="side-head">
+                <h2>错题本 / 改错</h2>
+                <div class="filters">
+                  <button class="chip active" data-filter="all">全部</button>
+                  <button class="chip" data-filter="unmastered">未掌握</button>
+                  <button class="chip" data-filter="mastered">已掌握</button>
+                </div>
+              </div>
+              <div id="mistakeList" class="list wide"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <div id="overlay" class="overlay hidden">
+      <div class="overlay-box">
+        <div class="spinner"></div>
+        <p id="overlayText">AI 处理中…</p>
+      </div>
+    </div>
+    <div id="toast" class="toast hidden"></div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
