@@ -18,8 +18,10 @@
       <nav class="tabs">
         <button class="tab active" data-view="generate">生成试卷</button>
         <button class="tab" data-view="exam">答题评卷</button>
+        <button class="tab" data-view="history">做题历史</button>
         <button class="tab" data-view="mistakes">错题本<em id="mistakeBadge"></em></button>
       </nav>
+      <span id="queueTag" class="queue-tag hidden" title="评卷在服务端后台排队执行，同一时刻只评一份"></span>
       <div class="topbar-right">
         <div class="model-pick">
           <select id="modelPick" title="选择命题 / 评卷使用的模型">
@@ -177,10 +179,58 @@
             </div>
           </div>
 
+          <!-- 历年真题（自有资料）：学习真题的提问方式 -->
+          <div class="field real-exam">
+            <label class="check-line">
+              <input type="checkbox" id="usePastPaper" />
+              <span>参考历年真题（自有资料）：上传 / 粘贴真题原文，AI 学习其提问方式后命题</span>
+            </label>
+
+            <div id="pastPaperOpts" class="real-opts hidden">
+              <label class="field">
+                <span>粘贴历年真题原文（可选）</span>
+                <textarea
+                  id="pastPaperText"
+                  rows="6"
+                  placeholder="把往年真题粘进来（题干、选项、分值都可以）。例如：&#10;1.（单选）下列关于……的说法正确的是（  ）&#10;A. ……  B. ……&#10;2.（简答）结合材料，分析……的原因。（8 分）"
+                ></textarea>
+              </label>
+
+              <div class="field">
+                <span>上传历年真题文档（可多选，解析结果自动入库）</span>
+                <div id="pastDropzone" class="dropzone">
+                  <input type="file" id="pastFiles" multiple accept=".pdf,.docx,.txt,.md,.markdown" hidden />
+                  <div class="dz-main">点击选择文件，或将真题文件拖到此处</div>
+                  <div class="hint">支持 PDF、Word(.docx)、TXT / Markdown，单个 ≤ 10MB，最多 8 个；解析后的正文会保存进「解析文档库」，可反复复用</div>
+                </div>
+                <div id="pastFileList" class="file-list"></div>
+              </div>
+
+              <label class="field">
+                <span>学习重点</span>
+                <select id="pastPaperMode">
+                  <option value="style">重点学习提问方式（推荐）</option>
+                  <option value="mix">提问方式 + 真题考点并重</option>
+                </select>
+              </label>
+              <span class="hint">AI 会模仿真题的设问角度、题干措辞、选项与作答要求，但不照抄原题；真题原文超过 12000 字时自动截取。</span>
+            </div>
+          </div>
+
           <label class="field">
             <span>附加要求（可选）</span>
             <textarea id="notes" rows="3" placeholder="例如：重点考查函数与导数；不要出现超纲内容；简答题需写出关键步骤"></textarea>
           </label>
+
+          <!-- 解析文档库：上传文档解析出的正文统一存这里（JSON 文档数据库） -->
+          <div class="field doc-lib">
+            <div class="side-head">
+              <h2>解析文档库</h2>
+              <button id="btnRefreshDocs" class="ghost small">刷新</button>
+            </div>
+            <div class="hint">上传的大纲 / 真题文档解析出的正文会自动保存在这里（随试卷数据一起存入 JSON 文档数据库），可查看全文、直接用于命题或删除。</div>
+            <div id="docList" class="doc-list"></div>
+          </div>
 
           <div class="actions">
             <button id="btnGenerate" class="primary">生成试卷</button>
@@ -205,6 +255,23 @@
           </aside>
           <div class="main-col">
             <div id="examPane"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 做题历史 -->
+      <section class="view hidden" id="view-history">
+        <div class="layout">
+          <button class="side-toggle" data-side="history" title="收起侧边栏">«</button>
+          <aside class="card side">
+            <div class="side-head">
+              <h2>科目</h2>
+              <button id="btnRefreshHistory" class="ghost small">刷新</button>
+            </div>
+            <div id="historySubjectNav" class="subject-nav"></div>
+          </aside>
+          <div class="main-col">
+            <div id="historyPane"></div>
           </div>
         </div>
       </section>

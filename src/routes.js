@@ -14,6 +14,7 @@ import {
 import { formatAnswer, isBlankAnswer, judgeObjective, normalizeQuestions } from './normalize.js';
 import { MAX_FILES, MAX_FILE_BYTES, MAX_OUTLINE_CHARS, extractText, isAccepted } from './parse.js';
 import { describeRemoved, describeShortfalls, duplicateStats, renumber, sortByType, trimToSpecs } from './validate.js';
+import { enqueue, findActiveJob, getJob, jobView, queueSnapshot } from './queue.js';
 import * as store from './store.js';
 
 const router = express.Router();
@@ -261,6 +262,17 @@ router.post(
     if (!cleanSpecs.length) throw httpError(400, '请至少选择一种题型并设置题量');
 
     const warnings = [];
+    // 历年真题（用户提供原文）：命题时学习其提问方式
+    const pastPaper = collectPastPaper(pastPaperArgs(req.body, String(subject).trim()));
+    if (pastPaper) {
+      console.log(
+        `[past-paper] 参考历年真题 ${pastPaper.files.length} 份 · ${pastPaper.chars} 字 · 模式 ${
+          pastPaper.mode === 'mix' ? '问法 + 考点' : '学习提问方式'
+        }`
+      );
+      if (pastPaper.truncated) warnings.push(`历年真题原文过长，已截取前 ${MAX_PAST_CHARS} 字用于学习提问方式`);
+    }
+
     // 先检索历年真题，再按「真题考点 : 大纲范围」的比例命题
     let realExam = null;
     if (req.body?.useRealExam) {
@@ -296,6 +308,7 @@ router.post(
           notes: [notes ? String(notes).trim() : '', extra].filter(Boolean).join('；'),
           totalPoints: specList.reduce((sum, s) => sum + s.count * s.points, 0),
           realExam,
+          pastPaper,
           history,
           historyNewRate,
         }),
@@ -328,10 +341,11 @@ router.post(
       history: dup
         ? { papers: history.papers, questions: history.questions, targetNewRate: historyNewRate, actualNewRate: dup.newRate }
         : null,
+      pastPaper: pastPaperBrief(pastPaper),
       createdAt: new Date().toISOString(),
     };
     store.addPaper(paper);
-    res.json({ paper: publicPaper(paper), realExam, warnings, history: paper.history });
+    res.json({ paper: publicPaper(paper), realExam, pastPaper: pastPaperBrief(pastPaper), warnings, history: paper.history });
   })
 );
 
@@ -351,7 +365,8 @@ router.post(
           warnings.push(`「${f.originalname}」未能提取到文字，可能是扫描版 PDF，已跳过`);
           continue;
         }
-        docs.push({ name: f.originalname, text });
+        const saved = store.saveParsedDocument({ name: f.originalname, size: f.size, text, kind: 'outline' });
+        docs.push({ name: f.originalname, size: f.size, text, docId: saved?.id || '' });
       } catch (err) {
         warnings.push(`「${f.originalname}」解析失败：${err.message}`);
       }
@@ -384,9 +399,13 @@ router.post(
     const difficulty = ['简单', '中等', '较难', '竞赛'].includes(rawDifficulty) ? rawDifficulty : '中等';
     const totalPoints = specs.reduce((sum, s) => sum + s.count * s.points, 0);
 
+    // 解析出的文档已在库里，这里补上 AI 识别到的科目，便于文档库按科目筛选
+    const subjectName = String(data?.subject || '').trim();
+    if (subjectName) for (const d of docs) if (d.docId) store.updateDocument(d.docId, { subject: subjectName });
+
     res.json({
       analysis: {
-        subject: String(data?.subject || '').trim(),
+        subject: subjectName,
         difficulty,
         duration: Number(data?.duration) || 0,
         totalPoints,
@@ -403,25 +422,36 @@ router.post(
   })
 );
 
-/** 上传大纲文档后立即解析，返回字数与预览（不调用 AI） */
+/**
+ * 上传文档后立即解析，返回字数与预览（不调用 AI）。
+ * 解析出来的正文会存进「解析文档库」（documents 集合），返回 docId 供后续命题直接复用。
+ * kind=past-paper 表示上传的是历年真题（默认 outline 大纲）。
+ */
 router.post(
   '/outline/preview',
   upload.array('files', MAX_FILES),
   wrap(async (req, res) => {
+    const kind = req.body?.kind === 'past-paper' ? 'past-paper' : 'outline';
+    const subject = String(req.body?.subject || '').trim();
     const files = [];
     for (const f of req.files || []) {
       try {
         const text = await extractText(f);
+        const saved = text
+          ? store.saveParsedDocument({ name: f.originalname, size: f.size, text, kind, subject })
+          : null;
         files.push({
           name: f.originalname,
           size: f.size,
           chars: text.length,
           preview: text.slice(0, 300),
           ok: Boolean(text),
+          docId: saved?.id || '',
           error: text ? '' : '未能提取到文字，可能是扫描版 PDF，请改用文本或 Word 文档',
         });
+        if (saved) console.log(`[document] 已保存解析结果「${saved.name}」· ${saved.chars} 字 · ${kind}`);
       } catch (err) {
-        files.push({ name: f.originalname, size: f.size, chars: 0, preview: '', ok: false, error: err.message });
+        files.push({ name: f.originalname, size: f.size, chars: 0, preview: '', ok: false, docId: '', error: err.message });
       }
     }
     res.json({ files });
@@ -447,7 +477,15 @@ router.post(
           warnings.push(`「${f.originalname}」未能提取到文字，可能是扫描版 PDF，已跳过`);
           continue;
         }
-        docs.push({ name: f.originalname, size: f.size, text });
+        // 解析结果落库，之后可复用 / 查看，不必重复上传
+        const saved = store.saveParsedDocument({
+          name: f.originalname,
+          size: f.size,
+          text,
+          kind: 'outline',
+          subject: String(subject).trim(),
+        });
+        docs.push({ name: f.originalname, size: f.size, text, docId: saved?.id || '' });
       } catch (err) {
         warnings.push(`「${f.originalname}」解析失败：${err.message}`);
       }
@@ -455,6 +493,17 @@ router.post(
 
     if (!docs.length && !manual) {
       throw httpError(400, warnings[0] || '请上传大纲文档，或在文本框中粘贴大纲内容');
+    }
+
+    // 历年真题：粘贴原文 + 已保存的真题解析文档，用于学习真题的提问方式
+    const pastPaper = collectPastPaper(pastPaperArgs(req.body, String(subject).trim()));
+    if (pastPaper) {
+      console.log(
+        `[past-paper] 参考历年真题 ${pastPaper.files.length} 份 · ${pastPaper.chars} 字${
+          pastPaper.truncated ? `（原文 ${pastPaper.rawChars} 字，已截断）` : ''
+        } · 模式 ${pastPaper.mode === 'mix' ? '问法 + 考点' : '学习提问方式'}`
+      );
+      if (pastPaper.truncated) warnings.push(`历年真题原文过长，已截取前 ${MAX_PAST_CHARS} 字用于学习提问方式`);
     }
 
     const blocks = [];
@@ -513,6 +562,7 @@ router.post(
           specs: specList,
           totalPoints: specList.length ? specList.reduce((sum, s) => sum + s.count * s.points, 0) : 100,
           realExam,
+          pastPaper,
           history,
           historyNewRate,
         }),
@@ -556,6 +606,7 @@ router.post(
       history: dup
         ? { papers: history.papers, questions: history.questions, targetNewRate: historyNewRate, actualNewRate: dup.newRate }
         : null,
+      pastPaper: pastPaperBrief(pastPaper),
       createdAt: new Date().toISOString(),
     };
     store.addPaper(paper);
@@ -583,17 +634,74 @@ router.post(
           }
         : {}),
       ...(realExam ? { realExam } : {}),
+      // 历年真题原文一并归档，下次直接从科目库复用其提问方式
+      ...(pastPaper
+        ? {
+            pastPaper: {
+              text: pastPaper.fullText,
+              files: pastPaper.files,
+              chars: pastPaper.chars,
+              rawChars: pastPaper.rawChars,
+              mode: pastPaper.mode,
+              docIds: pastPaper.docIds,
+              updatedAt: new Date().toISOString(),
+            },
+          }
+        : {}),
     });
     console.log(
-      `[subject] 已归档「${profile.name}」· 大纲 ${outlineText.length} 字 · 真题考点 ${(realExam?.keyPoints || []).length} 个`
+      `[subject] 已归档「${profile.name}」· 大纲 ${outlineText.length} 字 · 真题考点 ${
+        (realExam?.keyPoints || []).length
+      } 个 · 历年真题 ${pastPaper?.chars || 0} 字`
     );
 
     res.json({
       paper: publicPaper(paper),
       realExam,
       subject: subjectSummary(profile),
+      pastPaper: pastPaperBrief(pastPaper),
       meta: { truncated, coverage: paper.outline.coverage, files: paper.outline.files, warnings },
     });
+  })
+);
+
+/* ------------------------------ 解析文档库 ------------------------------ */
+
+/** 上传文档解析出来的正文（大纲 / 历年真题）都存在这里，可查看、复用与删除 */
+router.get(
+  '/documents',
+  wrap((req, res) => {
+    const kind = String(req.query?.kind || '').trim();
+    const subject = String(req.query?.subject || '').trim().toLowerCase();
+    const limit = req.query?.limit ? clampInt(req.query.limit, 1, 200) : 50;
+
+    let list = store.getDocuments();
+    if (kind) list = list.filter((d) => d.kind === kind);
+    if (subject) list = list.filter((d) => String(d.subject || '').trim().toLowerCase() === subject);
+
+    res.json({
+      documents: list.slice(0, limit).map(store.documentSummary),
+      total: list.length,
+      chars: list.reduce((sum, d) => sum + (d.chars || 0), 0),
+    });
+  })
+);
+
+router.get(
+  '/documents/:id',
+  wrap((req, res) => {
+    const doc = store.findDocument(req.params.id);
+    if (!doc) throw httpError(404, '文档不存在或已删除');
+    res.json({ document: { ...store.documentSummary(doc), text: doc.text } });
+  })
+);
+
+router.delete(
+  '/documents/:id',
+  wrap((req, res) => {
+    if (!store.findDocument(req.params.id)) throw httpError(404, '文档不存在或已删除');
+    store.removeDocument(req.params.id);
+    res.json({ ok: true });
   })
 );
 
@@ -611,6 +719,9 @@ function subjectSummary(s) {
     coverage: (s.outline?.coverage || s.analysis?.coverage || []).slice(0, 30),
     specs: s.analysis?.specs || [],
     hasRealExam: Boolean((s.realExam?.keyPoints || []).length),
+    pastPaperChars: s.pastPaper?.text?.length || 0,
+    pastPaperFiles: (s.pastPaper?.files || []).length,
+    pastPaperMode: s.pastPaper?.mode || 'style',
     examType: s.realExam?.examType || '',
     realExamRatio: s.realExam?.ratio || 50,
     realExamPoints: (s.realExam?.keyPoints || []).length,
@@ -631,6 +742,7 @@ function archiveSubject(payload) {
     ...(payload.outline ? { outline: payload.outline } : {}),
     ...(payload.analysis !== undefined ? { analysis: payload.analysis } : {}),
     ...(payload.realExam !== undefined ? { realExam: payload.realExam } : {}),
+    ...(payload.pastPaper !== undefined ? { pastPaper: payload.pastPaper } : {}),
   });
 }
 
@@ -651,6 +763,7 @@ router.get(
         ...subjectSummary(s),
         outline: s.outline?.text || '',
         realExam: s.realExam || null,
+        pastPaper: s.pastPaper || null,
       },
     });
   })
@@ -675,6 +788,24 @@ router.post(
             coverage: Array.isArray(raw?.coverage) ? raw.coverage.map(String).filter(Boolean).slice(0, 30) : [],
           };
 
+    // 历年真题原文（可选）：随档案一起保存，之后可直接复用其提问方式
+    const ppRaw = req.body?.pastPaper;
+    const pastPaperText = String(ppRaw?.text || '').trim();
+    const pastPaper = pastPaperText
+      ? {
+          text: pastPaperText.slice(0, MAX_OUTLINE_CHARS),
+          files: Array.isArray(ppRaw?.files)
+            ? ppRaw.files.slice(0, 8).map((f) => ({
+                name: String(f?.name || ''),
+                chars: Number(f?.chars) || 0,
+                docId: String(f?.docId || ''),
+              }))
+            : [],
+          mode: ppRaw?.mode === 'mix' ? 'mix' : 'style',
+          updatedAt: new Date().toISOString(),
+        }
+      : undefined;
+
     const saved = archiveSubject({
       name,
       difficulty: String(req.body?.difficulty || '中等').trim(),
@@ -682,6 +813,7 @@ router.post(
       ...(outline ? { outline } : {}),
       ...(req.body?.analysis ? { analysis: req.body.analysis } : {}),
       ...(req.body?.realExam ? { realExam: req.body.realExam } : {}),
+      ...(pastPaper ? { pastPaper } : {}),
     });
 
     res.json({ subject: subjectSummary(saved) });
@@ -761,6 +893,29 @@ router.post(
       console.log(`[history] 档案命题参考 ${history.papers} 份历史试卷 · ${history.questions} 道题 · 目标新题率 ${historyNewRate}%`);
     }
 
+    // 历年真题：优先用本次上传 / 粘贴的；否则按开关复用档案里保存的真题原文
+    const fromRequest = pastPaperArgs(req.body, name);
+    let pastPaper = collectPastPaper(fromRequest);
+    if (!pastPaper && req.body?.usePastPaper && profile.pastPaper?.text) {
+      pastPaper = collectPastPaper({
+        text: profile.pastPaper.text,
+        mode: req.body?.pastPaperMode || profile.pastPaper.mode,
+        name: '科目档案中的历年真题',
+        subject: name,
+      });
+      if (pastPaper) warnings.push('本次复用科目档案中已保存的历年真题原文');
+    }
+    if (req.body?.usePastPaper && !pastPaper) {
+      warnings.push('科目档案里还没有历年真题原文，可在「按大纲 / 文档」模式上传真题后保存');
+    }
+    if (pastPaper) {
+      console.log(
+        `[past-paper] 档案命题参考历年真题 ${pastPaper.files.length} 份 · ${pastPaper.chars} 字 · 模式 ${
+          pastPaper.mode === 'mix' ? '问法 + 考点' : '学习提问方式'
+        }`
+      );
+    }
+
     const build = (specList, extra) => {
       const mergedNotes = [notesText, extra].filter(Boolean).join('；');
       return outlineText
@@ -772,6 +927,7 @@ router.post(
             specs: specList,
             totalPoints: specList.length ? specList.reduce((sum, s) => sum + s.count * s.points, 0) : 100,
             realExam,
+            pastPaper,
             history,
             historyNewRate,
           })
@@ -782,6 +938,7 @@ router.post(
             notes: mergedNotes,
             totalPoints: specList.reduce((sum, s) => sum + s.count * s.points, 0),
             realExam,
+            pastPaper,
             history,
             historyNewRate,
           });
@@ -831,22 +988,37 @@ router.post(
       history: dup
         ? { papers: history.papers, questions: history.questions, targetNewRate: historyNewRate, actualNewRate: dup.newRate }
         : null,
+      pastPaper: pastPaperBrief(pastPaper),
       createdAt: new Date().toISOString(),
     };
     store.addPaper(paper);
 
-    // 回写档案：更新使用次数、本次覆盖的知识点，必要时保存新检索的真题考点
+    // 回写档案：更新使用次数、本次覆盖的知识点，必要时保存新检索的真题考点与本次上传的历年真题
     store.touchSubject(profile.id);
     const updated = archiveSubject({
       name: profile.name,
       ...(realExam ? { realExam } : {}),
       ...(coverage.length && profile.outline ? { outline: { ...profile.outline, coverage } } : {}),
+      ...(pastPaper && fromRequest
+        ? {
+            pastPaper: {
+              text: pastPaper.fullText,
+              files: pastPaper.files,
+              chars: pastPaper.chars,
+              rawChars: pastPaper.rawChars,
+              mode: pastPaper.mode,
+              docIds: pastPaper.docIds,
+              updatedAt: new Date().toISOString(),
+            },
+          }
+        : {}),
     });
 
     res.json({
       paper: publicPaper(paper),
       realExam,
       subject: subjectSummary(updated || profile),
+      pastPaper: pastPaperBrief(pastPaper),
       meta: { warnings, coverage, from: 'subject' },
     });
   })
@@ -879,14 +1051,15 @@ router.delete(
   })
 );
 
-/* ------------------------------ 评卷 ------------------------------ */
+/* ------------------------------ 评卷：后台排队，串行执行 ------------------------------ */
 
-router.post(
-  '/papers/:id/grade',
-  wrap(async (req, res) => {
-    const paper = store.findPaper(req.params.id);
-    if (!paper) throw httpError(404, '试卷不存在');
-    const answers = (req.body && req.body.answers) || {};
+/**
+ * 执行一次评卷：客观题本地判定，主观题 / 编程题交 AI，产出答卷并归档错题。
+ * 只由队列调用（同一时刻只有一个评卷在跑），不直接响应请求。
+ */
+async function gradeSubmission({ paperId, answers, onProgress }) {
+  const paper = store.findPaper(paperId);
+  if (!paper) throw httpError(404, '试卷不存在');
 
     const details = [];
     const toAI = [];
@@ -939,7 +1112,7 @@ router.post(
       objectiveBrief: objectiveBrief.join('\n') || '（无）',
       subjectiveList: toAI.map(({ localScore, ...rest }) => rest),
     });
-    const graded = await chatJSON({ system, user, temperature, maxTokens: 4096, label: '评卷' });
+    const graded = await chatJSON({ system, user, temperature, maxTokens: 4096, label: '评卷', onProgress });
 
     const aiMap = new Map();
     for (const item of Array.isArray(graded?.subjective) ? graded.subjective : []) {
@@ -1012,15 +1185,21 @@ router.post(
     };
     store.addSubmission(submission);
 
-    // 错题入本
+    // 错题本处理分两步：先处理做错的（入本 / 累计），再处理做对的（同题 + 同知识点标记为已掌握）
+    const allMistakes = store.getMistakes();
     const newMistakes = [];
+    const wrongIds = new Set(); // 本轮做错的题目，避免被「同知识点做对」连带掌握
+
+    // 1) 做错的：入本 / 累计错误次数
     for (const d of details) {
       if (d.isCorrect) continue;
+      wrongIds.add(d.questionId);
       const question = paper.questions.find((q) => q.id === d.questionId);
-      const exist = store
-        .getMistakes()
-        .find((m) => m.paperId === paper.id && m.questionId === d.questionId && !m.mastered);
+      const exist = allMistakes.find((m) => m.paperId === paper.id && m.questionId === d.questionId);
       if (exist) {
+        exist.mastered = false; // 又做错了：即便之前已掌握，也要重新回到错题本
+        exist.masteredAt = null;
+        exist.masteredByKnowledge = null;
         exist.studentAnswer = d.studentAnswer;
         exist.lastWrongAt = submission.createdAt;
         exist.wrongTimes = (exist.wrongTimes || 1) + 1;
@@ -1035,6 +1214,7 @@ router.post(
           submissionId: submission.id,
           questionId: d.questionId,
           subject: paper.subject,
+          knowledge: d.knowledge || question?.knowledge || '', // 用于错题本按知识点分组
           question,
           studentAnswer: d.studentAnswer,
           comment: d.comment,
@@ -1048,7 +1228,94 @@ router.post(
       );
     }
 
-    res.json({ submission, mistakes: newMistakes.length });
+    // 2) 做对的：同题错题 + 错题本里同知识点（且本轮没做错）的错题一并标记为已掌握
+    const masteredMistakes = [];
+    const masteredIds = new Set();
+    for (const d of details) {
+      if (!d.isCorrect) continue;
+      const own = allMistakes.find(
+        (m) => m.paperId === paper.id && m.questionId === d.questionId && !m.mastered
+      );
+      const hit = [];
+      if (own) hit.push(own);
+      if (d.knowledge) {
+        for (const m of allMistakes) {
+          if (m.mastered || m === own || masteredIds.has(m.id)) continue;
+          // 本卷里这道题这次做错了，就不能因为同知识点别的题做对而算它掌握
+          if (m.paperId === paper.id && wrongIds.has(m.questionId)) continue;
+          if (sameKnowledge(m, d.knowledge)) hit.push(m);
+        }
+      }
+      for (const m of hit) {
+        if (masteredIds.has(m.id)) continue;
+        masteredIds.add(m.id);
+        m.mastered = true;
+        m.masteredAt = submission.createdAt;
+        m.masteredBySubmissionId = submission.id;
+        if (m === own) m.studentAnswer = d.studentAnswer; // 记录这次做对的答案
+        else m.masteredByKnowledge = d.knowledge; // 因同知识点的题做对而连带掌握
+        masteredMistakes.push(m);
+      }
+      if (hit.length) {
+        store.save();
+        d.mistakeMastered = true; // 结果页据此提示「已消灭错题」
+        d.knowledgeMastered = hit.length; // 本次因该知识点消灭的错题数
+      }
+    }
+
+    if (masteredMistakes.length) {
+      submission.masteredCount = masteredMistakes.length; // 本次消灭的错题数
+      store.save();
+    }
+
+    return { submission, mistakes: newMistakes.length, mastered: masteredMistakes.length };
+}
+
+/**
+ * 提交答卷：立即返回后台任务，评卷在服务端排队执行。
+ * 同一份试卷已有未完成的评卷任务时直接复用，不会重复排队。
+ */
+router.post(
+  '/papers/:id/grade',
+  wrap((req, res) => {
+    const paper = store.findPaper(req.params.id);
+    if (!paper) throw httpError(404, '试卷不存在');
+    const answers = (req.body && req.body.answers) || {};
+
+    const active = findActiveJob({ type: 'grade', paperId: paper.id });
+    if (active) return res.json({ job: jobView(active), duplicated: true });
+
+    const job = enqueue({
+      type: 'grade',
+      label: `评卷：${paper.title}`,
+      meta: { paperId: paper.id, paperTitle: paper.title, subject: paper.subject },
+      run: (report) => gradeSubmission({ paperId: paper.id, answers, onProgress: report }),
+    });
+    console.log(`[grade] 已入队 · ${job.id} · ${paper.title}`);
+    res.json({ job: jobView(job) });
+  })
+);
+
+/** 查询后台任务进度；评卷完成后一并返回答卷 */
+router.get(
+  '/jobs/:id',
+  wrap((req, res) => {
+    const job = getJob(req.params.id);
+    if (!job) throw httpError(404, '任务不存在或已过期');
+    const view = jobView(job);
+    if (job.status === 'done' && job.result) {
+      const { submission, mistakes, mastered } = job.result;
+      return res.json({ job: view, submission, mistakes, mastered });
+    }
+    res.json({ job: view });
+  })
+);
+
+/** 队列概况：正在执行的任务与排队中的任务 */
+router.get(
+  '/jobs',
+  wrap((req, res) => {
+    res.json(queueSnapshot());
   })
 );
 
@@ -1070,6 +1337,79 @@ router.get(
   })
 );
 
+/* ------------------------------ 做题历史 ------------------------------ */
+
+/** 做题历史总览：累计次数 / 最近做题时间与成绩 / 按科目与按试卷的统计 / 逐次记录 */
+router.get(
+  '/history',
+  wrap((req, res) => {
+    const subs = [...store.getSubmissions()].sort(
+      (a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0)
+    );
+
+    const records = subs.slice(0, 500).map((s) => ({
+      id: s.id,
+      paperId: s.paperId,
+      paperTitle: s.paperTitle,
+      subject: s.subject,
+      createdAt: s.createdAt,
+      earnedScore: s.earnedScore,
+      totalScore: s.totalScore,
+      accuracy: s.accuracy,
+      correctCount: s.correctCount,
+      questionCount: s.questionCount,
+    }));
+
+    // 按科目汇总
+    const subjectBuckets = new Map();
+    for (const s of subs) {
+      const key = String(s.subject || '').trim() || '未分类';
+      let b = subjectBuckets.get(key);
+      if (!b) {
+        b = { subject: key, subs: [], paperIds: new Set() };
+        subjectBuckets.set(key, b);
+      }
+      b.subs.push(s);
+      if (s.paperId) b.paperIds.add(s.paperId);
+    }
+    const bySubject = [...subjectBuckets.values()]
+      .map((b) => summarizeAttempts(b.subs, { subject: b.subject, papers: b.paperIds.size }))
+      .sort((a, b) => new Date(b.lastAt || 0) - new Date(a.lastAt || 0));
+
+    // 按试卷汇总
+    const paperBuckets = new Map();
+    for (const s of subs) {
+      if (!s.paperId) continue;
+      let b = paperBuckets.get(s.paperId);
+      if (!b) {
+        b = { subs: [], info: { paperId: s.paperId, title: s.paperTitle, subject: s.subject } };
+        paperBuckets.set(s.paperId, b);
+      }
+      b.subs.push(s);
+    }
+    const byPaper = [...paperBuckets.values()]
+      .map((b) => summarizeAttempts(b.subs, b.info))
+      .sort((a, b) => new Date(b.lastAt || 0) - new Date(a.lastAt || 0));
+
+    const last = subs[0] || null;
+    const overview = {
+      attempts: subs.length,
+      papers: byPaper.length,
+      subjects: bySubject.length,
+      avgAccuracy: subs.length
+        ? Number((subs.reduce((sum, s) => sum + (Number(s.accuracy) || 0), 0) / subs.length).toFixed(1))
+        : 0,
+      lastAt: last?.createdAt || null,
+      lastScore: last ? last.earnedScore : null,
+      lastTotalScore: last ? last.totalScore : null,
+      lastAccuracy: last ? last.accuracy : null,
+      lastPaperTitle: last?.paperTitle || '',
+    };
+
+    res.json({ overview, bySubject, byPaper, records });
+  })
+);
+
 /* ------------------------------ 错题本 / 改错 ------------------------------ */
 
 router.get(
@@ -1078,7 +1418,10 @@ router.get(
     let list = store.getMistakes();
     if (req.query.mastered === 'true') list = list.filter((m) => m.mastered);
     if (req.query.mastered === 'false') list = list.filter((m) => !m.mastered);
-    res.json({ mistakes: list });
+    // 老错题没有顶层 knowledge，从题目里补出来，供前端按知识点分组
+    res.json({
+      mistakes: list.map((m) => ({ ...m, knowledge: m.knowledge || m.question?.knowledge || '' })),
+    });
   })
 );
 
@@ -1132,13 +1475,11 @@ router.post(
   })
 );
 
-router.post(
-  '/mistakes/:id/variants/grade',
-  wrap(async (req, res) => {
-    const m = store.findMistake(req.params.id);
-    if (!m) throw httpError(404, '错题不存在');
-    if (!m.variants) throw httpError(400, '请先生成变式题');
-    const answers = (req.body && req.body.answers) || {};
+/** 批改变式题：与试卷评卷共用一条队列，避免并发调用模型 */
+async function gradeVariants({ mistakeId, answers }) {
+  const m = store.findMistake(mistakeId);
+  if (!m) throw httpError(404, '错题不存在');
+  if (!m.variants) throw httpError(400, '请先生成变式题');
 
     const toAI = [];
     const result = [];
@@ -1225,7 +1566,26 @@ router.post(
     };
     if (allCorrect) m.variants.passedOnce = true;
     store.save();
-    res.json({ mistake: m, passed: allCorrect });
+    return { mistake: m, passed: allCorrect };
+}
+
+router.post(
+  '/mistakes/:id/variants/grade',
+  wrap(async (req, res) => {
+    const m = store.findMistake(req.params.id);
+    if (!m) throw httpError(404, '错题不存在');
+    const answers = (req.body && req.body.answers) || {};
+
+    // 入队执行：请求会等到排队结束，但同一时刻只会有一个评卷 / 批改在跑
+    const job = enqueue({
+      type: 'variant-grade',
+      label: '变式题批改',
+      meta: { mistakeId: m.id },
+      run: () => gradeVariants({ mistakeId: m.id, answers }),
+    });
+    await job.promise;
+    if (job.status === 'error') throw httpError(500, job.error || '批改失败');
+    res.json(job.result);
   })
 );
 
@@ -1253,6 +1613,95 @@ router.delete(
 );
 
 /* ------------------------------ 工具函数 ------------------------------ */
+
+/** 拼进 prompt 的历年真题原文上限（字符），超出截断 */
+const MAX_PAST_CHARS = 12000;
+
+/** 表单 / JSON 里的 id 数组（可能是 JSON 字符串或逗号分隔） */
+function parseIdsField(raw) {
+  if (Array.isArray(raw)) return raw.map((x) => String(x || '').trim()).filter(Boolean);
+  const text = String(raw || '').trim();
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) return parsed.map((x) => String(x || '').trim()).filter(Boolean);
+  } catch {
+    /* 退化为逗号分隔 */
+  }
+  return text.split(',').map((x) => x.trim()).filter(Boolean);
+}
+
+/** 把上传解析出的文档正文存进「解析文档库」，返回文档记录 */
+function saveParsedDocs(docs, { kind = 'outline', subject = '' } = {}) {
+  return (docs || [])
+    .map((d) => store.saveParsedDocument({ name: d.name, size: d.size, text: d.text, kind, subject }))
+    .filter(Boolean);
+}
+
+/**
+ * 汇总本次使用的历年真题原文：粘贴的文本 + 已保存的解析文档（上传真题的解析结果）。
+ * 返回 null 表示没有可用真题；prompt 用 text（可能截断），归档用 fullText。
+ */
+function collectPastPaper({ text, docIds, subject, mode, name } = {}) {
+  const pasted = String(text || '').trim();
+  const docs = parseIdsField(docIds)
+    .map((id) => store.findDocument(id))
+    .filter((d) => d && String(d.text || '').trim());
+
+  const blocks = [];
+  const files = [];
+  if (pasted) {
+    blocks.push(`【粘贴的历年真题】\n${pasted}`);
+    files.push({ name: String(name || '').trim() || '粘贴的真题文本', chars: pasted.length, docId: '' });
+  }
+  for (const d of docs) {
+    blocks.push(`【真题文件：${d.name}】\n${String(d.text).trim()}`);
+    files.push({ name: d.name, chars: d.chars || String(d.text).length, docId: d.id });
+    const nextSubject = subject ? String(subject).trim() : '';
+    if (d.kind !== 'past-paper' || (nextSubject && d.subject !== nextSubject)) {
+      store.updateDocument(d.id, { kind: 'past-paper', ...(nextSubject ? { subject: nextSubject } : {}) });
+    }
+  }
+  if (!blocks.length) return null;
+
+  const fullText = blocks.join('\n\n');
+  const truncated = fullText.length > MAX_PAST_CHARS;
+  return {
+    text: truncated ? fullText.slice(0, MAX_PAST_CHARS) : fullText,
+    fullText,
+    files,
+    chars: Math.min(fullText.length, MAX_PAST_CHARS),
+    rawChars: fullText.length,
+    truncated,
+    mode: mode === 'mix' ? 'mix' : 'style',
+    docIds: docs.map((d) => d.id),
+  };
+}
+
+/** 写进试卷 / 科目档案的真题摘要（不含原文） */
+function pastPaperBrief(pastPaper) {
+  if (!pastPaper) return null;
+  return {
+    files: pastPaper.files,
+    chars: pastPaper.chars,
+    rawChars: pastPaper.rawChars,
+    truncated: pastPaper.truncated,
+    mode: pastPaper.mode,
+    docIds: pastPaper.docIds,
+  };
+}
+
+/** 把 form / json 里的真题参数解析成 collectPastPaper 入参 */
+function pastPaperArgs(body, subject) {
+  const use = Boolean(body?.usePastPaper ?? body?.pastPaperText ?? body?.pastDocIds);
+  if (!use) return null;
+  return {
+    text: body?.pastPaperText,
+    docIds: body?.pastDocIds ?? body?.pastPaperDocs,
+    mode: body?.pastPaperMode,
+    subject,
+  };
+}
 
 function makeDetail(q, studentAnswer, local) {
   return {
@@ -1355,6 +1804,24 @@ function defaultPts(type) {
   ] || 3;
 }
 
+/** 知识点归一化：去空白 + 忽略大小写，用于比较两份知识点是否相同 */
+function normalizeKnowledge(v) {
+  return String(v || '').trim().toLowerCase().replace(/\s+/g, '');
+}
+
+/**
+ * 判断错题是否属于某个知识点：完全相同，或一个知识点包含另一个（较短者至少 3 字），
+ * 与错题本前端的分组口径保持一致，例如「中国式现代化」覆盖「中国式现代化中国特色」。
+ */
+function sameKnowledge(mistake, knowledge) {
+  const a = normalizeKnowledge(mistake?.knowledge || mistake?.question?.knowledge);
+  const b = normalizeKnowledge(knowledge);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const [short, long] = a.length <= b.length ? [a, b] : [b, a];
+  return short.length >= 3 && long.includes(short);
+}
+
 function clampInt(value, min, max) {
   const n = Math.floor(Number(value));
   if (!Number.isFinite(n)) return min;
@@ -1398,6 +1865,56 @@ function summary(paper) {
     questionCount: paper.questions.length,
     totalPoints: paper.questions.reduce((s, q) => s + q.points, 0),
     types: [...new Set(paper.questions.map((q) => q.type))],
+    stats: paperStats(paper.id),
+  };
+}
+
+/**
+ * 某份试卷的做题统计：次数 / 最近一次（时间与成绩）/ 最好一次 / 平均正确率。
+ * submissions 是 unshift 入库，但仍按时间倒序排一遍，避免历史数据顺序不一致。
+ */
+function paperStats(paperId) {
+  if (!paperId) return null;
+  const subs = store
+    .getSubmissions()
+    .filter((s) => s.paperId === paperId)
+    .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+  if (!subs.length) return null;
+
+  const last = subs[0];
+  const best = subs.reduce((m, s) => (Number(s.earnedScore) > Number(m.earnedScore) ? s : m), subs[0]);
+  const avg = subs.reduce((sum, s) => sum + (Number(s.accuracy) || 0), 0) / subs.length;
+
+  return {
+    attempts: subs.length,
+    lastAt: last.createdAt,
+    lastScore: last.earnedScore,
+    lastTotalScore: last.totalScore,
+    lastAccuracy: last.accuracy,
+    lastCorrectCount: last.correctCount,
+    lastQuestionCount: last.questionCount,
+    bestScore: best.earnedScore,
+    bestAccuracy: best.accuracy,
+    avgAccuracy: Number(avg.toFixed(1)),
+  };
+}
+
+/** 把一批答卷汇总成「次数 / 最近时间 / 最近成绩 / 平均正确率」 */
+function summarizeAttempts(subs, extra) {
+  const list = [...subs].sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+  if (!list.length) return null;
+  const last = list[0];
+  const best = list.reduce((m, s) => (Number(s.earnedScore) > Number(m.earnedScore) ? s : m), list[0]);
+  const avg = list.reduce((sum, s) => sum + (Number(s.accuracy) || 0), 0) / list.length;
+  return {
+    ...extra,
+    attempts: list.length,
+    lastAt: last.createdAt,
+    lastScore: last.earnedScore,
+    lastTotalScore: last.totalScore,
+    lastAccuracy: last.accuracy,
+    bestScore: best.earnedScore,
+    avgAccuracy: Number(avg.toFixed(1)),
   };
 }
 

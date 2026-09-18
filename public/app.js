@@ -46,6 +46,11 @@ const state = {
   view: 'generate',
   mode: 'spec',
   outlineFiles: [],
+  pastFiles: [], // 本次用于命题的历年真题文档（解析后带 docId）
+  pastPick: [], // 从「解析文档库」中选中的真题文档 id
+  pastDocs: [], // 解析文档库列表（摘要）
+  docTexts: {}, // 文档库：查看全文时按需拉取并缓存
+  expandedDocs: {}, // 文档库展开状态
   outlineMeta: null,
   outlineAnalysis: null,
   realExam: null,
@@ -60,24 +65,32 @@ const state = {
   paper: null, // 当前答题试卷（exam 模式）
   answers: {},
   result: null,
+  grading: null, // 后台评卷任务：{ jobId, paperId, status, position, waiting, progress, startedAt, fails }
+  viewingHistory: false, // 当前结果页是否来自「做题历史」
+  paperSubmissions: [], // 当前试卷的历史答卷
+  history: null, // 做题历史（总览 / 按科目 / 按试卷 / 逐次记录）
+  historySubject: '', // 做题历史左栏选中的科目（'' = 全部科目）
   mistakes: [],
   mistakeFilter: 'all',
   variantAnswers: {},
   expanded: {},
   collapsedSubjects: {}, // 试卷列表「按科目」分组的折叠状态：{ [科目名]: true }
-  collapsedMistakeSubjects: {}, // 错题本「按科目」分组的折叠状态：{ [科目名]: true }
+  collapsedMistakeSubjects: {}, // 错题本「科目」分组的折叠状态：{ [科目名]: true }
+  collapsedMistakeKnowledges: {}, // 错题本「科目 → 知识点」的折叠状态：{ [科目::知识点]: true }
   paperSubject: '', // 左栏选中的科目（'' = 全部科目）
-  mistakeSubject: '',
+  mistakeSubject: '', // 错题本左栏选中的科目（'' = 全部科目）
 };
+
+const UNKNOWN_KNOWLEDGE = '未标注知识点';
 
 /** 取条目所属科目名，空则归为「未分类」 */
 function subjectOf(item) {
   return String(item.subject || '').trim() || '未分类';
 }
 
-/** 渲染左栏科目导航；entries 为 [{ name, count }] */
-function renderSubjectNav(el, entries, activeName, onPick) {
-  const rows = [{ name: '', label: '全部科目', count: entries.reduce((s, e) => s + e.count, 0) }].concat(
+/** 渲染左栏导航；entries 为 [{ name, count }]，allLabel 为「全部」项的文案 */
+function renderSubjectNav(el, entries, activeName, onPick, allLabel = '全部科目') {
+  const rows = [{ name: '', label: allLabel, count: entries.reduce((s, e) => s + e.count, 0) }].concat(
     entries.map((e) => ({ ...e, label: e.name }))
   );
   el.innerHTML = rows
@@ -170,6 +183,19 @@ function answerText(type, ans) {
 
 function letter(i) {
   return String.fromCharCode(65 + i);
+}
+
+/** 时间简写：09-18 14:05；跨年时带上年份 */
+function fmtTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const now = new Date();
+  const sameYear = d.getFullYear() === now.getFullYear();
+  const date = sameYear
+    ? `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+    : `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  return `${date} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
 function humanSize(bytes) {
@@ -289,6 +315,8 @@ async function init() {
   loadMistakes();
   loadSubjects();
   loadModels();
+  loadHistory();
+  loadDocuments();
 }
 
 function bindGlobal() {
@@ -314,34 +342,26 @@ function bindGlobal() {
   $('#specRows').addEventListener('input', onSpecInput);
   $('#btnRefreshPapers').addEventListener('click', loadPapers);
   $('#btnRefreshMistakes').addEventListener('click', loadMistakes);
+  $('#btnRefreshHistory').addEventListener('click', loadHistory);
+  $('#historyPane').addEventListener('click', onHistoryClick);
+  $('#examPane').addEventListener('click', onHistoryClick);
   initSideToggles();
   $('#modelPick').addEventListener('change', (e) => changeModel(e.target.value));
   $('#btnRefreshModels').addEventListener('click', () => loadModels(true));
 
-  const dz = $('#dropzone');
-  const fileInput = $('#outlineFiles');
-  dz.addEventListener('click', () => fileInput.click());
-  // 避免程序化 click 冒泡回 dropzone 造成递归
-  fileInput.addEventListener('click', (e) => e.stopPropagation());
-  fileInput.addEventListener('change', () => {
-    addFiles(fileInput.files);
-    fileInput.value = '';
-  });
-  ['dragenter', 'dragover'].forEach((ev) =>
-    dz.addEventListener(ev, (e) => {
-      e.preventDefault();
-      dz.classList.add('over');
-    })
-  );
-  ['dragleave', 'drop'].forEach((ev) => dz.addEventListener(ev, () => dz.classList.remove('over')));
-  dz.addEventListener('drop', (e) => {
-    e.preventDefault();
-    addFiles(e.dataTransfer && e.dataTransfer.files);
-  });
+  bindFilePicker('#dropzone', '#outlineFiles', 'outline');
+  bindFilePicker('#pastDropzone', '#pastFiles', 'past-paper');
   // 拖到页面其它位置时不要让浏览器直接打开文件
   window.addEventListener('dragover', (e) => e.preventDefault());
   window.addEventListener('drop', (e) => e.preventDefault());
   $('#fileList').addEventListener('click', onFileAction);
+  $('#pastFileList').addEventListener('click', onFileAction);
+
+  $('#usePastPaper').addEventListener('change', (e) => {
+    $('#pastPaperOpts').classList.toggle('hidden', !e.target.checked);
+  });
+  $('#btnRefreshDocs').addEventListener('click', loadDocuments);
+  $('#docList').addEventListener('click', onDocAction);
 
   $('#examPane').addEventListener('input', onAnswerInput);
   $('#examPane').addEventListener('change', onAnswerInput);
@@ -395,10 +415,14 @@ function initSideToggles() {
 function switchView(view) {
   state.view = view;
   $$('.tab').forEach((t) => t.classList.toggle('active', t.dataset.view === view));
-  ['generate', 'exam', 'mistakes'].forEach((v) => {
+  ['generate', 'exam', 'history', 'mistakes'].forEach((v) => {
     $('#view-' + v).classList.toggle('hidden', v !== view);
   });
-  if (view === 'exam') loadPapers();
+  if (view === 'exam') {
+    loadPapers();
+    renderExam(); // 后台评卷结束时可能已出结果，切回来要同步展示
+  }
+  if (view === 'history') loadHistory();
   if (view === 'mistakes') loadMistakes();
 }
 
@@ -473,9 +497,38 @@ function updateTotal() {
   $('#totalInfo').textContent = `共 ${count} 题，约 ${points} 分`;
 }
 
-/* ------------------------------ 大纲文档 ------------------------------ */
+/* ------------------------------ 上传文件（大纲 / 历年真题） ------------------------------ */
 
-function addFiles(fileList) {
+/** 文件选择区（点击 / 拖拽）绑定；kind 区分大纲文档与历年真题文档 */
+function bindFilePicker(dropId, inputId, kind) {
+  const dz = $(dropId);
+  const fileInput = $(inputId);
+  dz.addEventListener('click', () => fileInput.click());
+  // 避免程序化 click 冒泡回 dropzone 造成递归
+  fileInput.addEventListener('click', (e) => e.stopPropagation());
+  fileInput.addEventListener('change', () => {
+    addFiles(fileInput.files, kind);
+    fileInput.value = '';
+  });
+  ['dragenter', 'dragover'].forEach((ev) =>
+    dz.addEventListener(ev, (e) => {
+      e.preventDefault();
+      dz.classList.add('over');
+    })
+  );
+  ['dragleave', 'drop'].forEach((ev) => dz.addEventListener(ev, () => dz.classList.remove('over')));
+  dz.addEventListener('drop', (e) => {
+    e.preventDefault();
+    addFiles(e.dataTransfer && e.dataTransfer.files, kind);
+  });
+}
+
+const isPastKind = (kind) => kind === 'past-paper';
+const bucketOf = (kind) => (isPastKind(kind) ? state.pastFiles : state.outlineFiles);
+const fileListElOf = (kind) => $(isPastKind(kind) ? '#pastFileList' : '#fileList');
+
+function addFiles(fileList, kind = 'outline') {
+  const bucket = bucketOf(kind);
   const incoming = [...(fileList || [])];
   if (!incoming.length) return;
   const rejected = [];
@@ -489,28 +542,33 @@ function addFiles(fileList) {
       rejected.push(`${f.name}：超过 10MB`);
       continue;
     }
-    if (state.outlineFiles.length >= MAX_FILES) {
+    if (bucket.length >= MAX_FILES) {
       rejected.push(`${f.name}：最多上传 8 个文件`);
       continue;
     }
-    if (state.outlineFiles.some((x) => x.name === f.name && x.size === f.size)) {
+    if (bucket.some((x) => x.name === f.name && x.size === f.size)) {
       rejected.push(`${f.name}：已添加`);
       continue;
     }
-    state.outlineFiles.push({ file: f, name: f.name, size: f.size, chars: null, ok: null, error: '' });
+    bucket.push({ file: f, name: f.name, size: f.size, chars: null, ok: null, error: '', docId: '' });
   }
 
   if (rejected.length) toast(rejected.join('；'), true);
-  renderFileList();
-  previewFiles();
+  renderFileList(kind);
+  previewFiles(kind);
 }
 
-async function previewFiles() {
-  const pending = state.outlineFiles.filter((f) => f.chars === null);
+/** 解析上传文档（解析结果同时保存进「解析文档库」），回填字数与 docId */
+async function previewFiles(kind = 'outline') {
+  const bucket = bucketOf(kind);
+  const pending = bucket.filter((f) => f.chars === null);
   if (!pending.length) return;
 
   const fd = new FormData();
   pending.forEach((f) => fd.append('files', f.file, f.name));
+  fd.append('kind', kind);
+  const subject = $('#subject').value.trim();
+  if (subject) fd.append('subject', subject);
   try {
     const { files } = await api('/outline/preview', { method: 'POST', body: fd });
     files.forEach((r, i) => {
@@ -519,7 +577,9 @@ async function previewFiles() {
       target.chars = r.chars;
       target.ok = r.ok;
       target.error = r.error || '';
+      target.docId = r.docId || '';
     });
+    loadDocuments(); // 解析结果已入库，刷新文档库
   } catch (e) {
     pending.forEach((p) => {
       p.chars = 0;
@@ -527,7 +587,114 @@ async function previewFiles() {
       p.error = e.message;
     });
   }
-  renderFileList();
+  renderFileList(kind);
+}
+
+/* ------------------------------ 解析文档库 ------------------------------ */
+
+const docKindLabel = (kind) => (kind === 'past-paper' ? '历年真题' : '大纲 / 文档');
+
+async function loadDocuments() {
+  try {
+    const { documents } = await api('/documents?limit=20');
+    state.pastDocs = documents;
+    renderDocList();
+  } catch (e) {
+    /* 忽略 */
+  }
+}
+
+function renderDocList() {
+  const el = $('#docList');
+  if (!state.pastDocs.length) {
+    el.innerHTML =
+      '<div class="doc-empty">还没有解析文档：上传大纲或历年真题文档后，解析出的正文会自动保存在这里。</div>';
+    return;
+  }
+  el.innerHTML = state.pastDocs
+    .map((d) => {
+      const picked = state.pastPick.includes(d.id);
+      const open = Boolean(state.expandedDocs[d.id]);
+      const text = state.docTexts[d.id];
+      const time = esc(String(d.updatedAt || '').slice(0, 16).replace('T', ' '));
+      return `
+    <div class="doc-item ${picked ? 'picked' : ''}" data-id="${esc(d.id)}">
+      <div class="n">
+        <b title="${esc(d.name)}">${esc(d.name)}</b>
+        <span class="s">${docKindLabel(d.kind)}${d.subject ? ` · ${esc(d.subject)}` : ''} · ${d.chars} 字 · ${time}</span>
+        ${open ? `<pre>${esc(text || d.preview || '（加载中…）')}</pre>` : ''}
+      </div>
+      <div class="ops">
+        <button class="ghost small" data-act="view">${open ? '收起' : '查看'}</button>
+        <button class="ghost small" data-act="pick" title="把这份文档的原文用于本次命题">${
+          picked ? '已选用于命题' : '用于命题'
+        }</button>
+        <button class="ghost small danger" data-act="del">删除</button>
+      </div>
+    </div>`;
+    })
+    .join('');
+}
+
+async function onDocAction(e) {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+  const item = btn.closest('.doc-item');
+  const id = item && item.dataset.id;
+  if (!id) return;
+
+  if (btn.dataset.act === 'view') {
+    const open = !state.expandedDocs[id];
+    state.expandedDocs[id] = open;
+    if (open && !state.docTexts[id]) {
+      try {
+        const { document } = await api(`/documents/${encodeURIComponent(id)}`);
+        state.docTexts[id] = document.text;
+      } catch (err) {
+        toast(err.message, true);
+      }
+    }
+    renderDocList();
+    return;
+  }
+
+  if (btn.dataset.act === 'pick') {
+    const picked = state.pastPick.includes(id);
+    state.pastPick = picked ? state.pastPick.filter((x) => x !== id) : [...state.pastPick, id];
+    if (!picked) {
+      // 选中即打开真题开关
+      $('#usePastPaper').checked = true;
+      $('#pastPaperOpts').classList.remove('hidden');
+    }
+    renderDocList();
+    return;
+  }
+
+  if (btn.dataset.act === 'del') {
+    if (!confirm('删除这份解析文档？已生成的试卷不受影响。')) return;
+    try {
+      await api(`/documents/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      state.pastPick = state.pastPick.filter((x) => x !== id);
+      delete state.docTexts[id];
+      delete state.expandedDocs[id];
+      await loadDocuments();
+      toast('解析文档已删除');
+    } catch (err) {
+      toast(err.message, true);
+    }
+  }
+}
+
+/** 本次命题要用的历年真题参数（粘贴原文 + 上传解析文档 + 文档库选项） */
+function pastPaperPayload() {
+  const use = $('#usePastPaper').checked;
+  const docIds = [...state.pastFiles.map((f) => f.docId), ...state.pastPick].filter(Boolean);
+  return {
+    usePastPaper: use,
+    pastPaperText: use ? $('#pastPaperText').value.trim() : '',
+    pastDocIds: use ? docIds : [],
+    pastPaperMode: $('#pastPaperMode').value,
+  };
 }
 
 /* --------------------------- 大纲 AI 分析 --------------------------- */
@@ -743,6 +910,10 @@ async function loadSubjects(preferredId) {
 
 /** 选中档案：回填科目 / 难度 / 大纲 / 题型 / 真题考点，之后可直接生成 */
 async function pickSubject(id) {
+  // 换档案时清空上一份资料里挑的真题文档，避免跨科目误用
+  state.pastPick = [];
+  renderDocList();
+
   if (!id) {
     state.activeSubject = null;
     state.focusPoints = [];
@@ -778,6 +949,12 @@ async function pickSubject(id) {
       if (subject.realExam.ratio) $('#realExamRatio').value = subject.realExam.ratio;
       renderRealExam();
     }
+    // 档案里保存过历年真题原文：自动打开真题开关，生成时直接复用其提问方式
+    if (subject.pastPaperChars) {
+      $('#usePastPaper').checked = true;
+      $('#pastPaperOpts').classList.remove('hidden');
+      if (subject.pastPaperMode) $('#pastPaperMode').value = subject.pastPaperMode;
+    }
     renderSubjectInfo();
     toast(`已载入科目「${subject.name}」，可直接生成`);
   } catch (e) {
@@ -812,7 +989,7 @@ function renderSubjectInfo() {
     s.outlineFiles ? `（${s.outlineFiles} 个文件）` : ''
   } · 真题考点 ${s.realExamPoints || 0} 个${
     s.realExam && s.realExam.updatedAt ? `（${esc(String(s.realExam.updatedAt).slice(0, 10))} 检索）` : ''
-  }
+  } · 历年真题 ${s.pastPaperChars || 0} 字
     <div class="hint">点击知识点可设为「本次重点」（可多选）；不选则按档案整体范围命题。生成时无需再上传 / 解析大纲。</div>
     ${chips ? `<div class="chips">${chips}</div>` : ''}`;
   el.classList.remove('hidden');
@@ -835,8 +1012,10 @@ async function saveSubject() {
 
   const outline = $('#outlineText').value.trim();
   const files = state.outlineFiles.map((f) => ({ name: f.name, size: f.size, chars: f.chars || 0 }));
-  if (!outline && !files.length && !state.activeSubject) {
-    return toast('请先粘贴大纲或上传大纲文档，再保存到科目库', true);
+  const pastText = $('#pastPaperText').value.trim();
+  const pastFiles = state.pastFiles.map((f) => ({ name: f.name, chars: f.chars || 0, docId: f.docId || '' }));
+  if (!outline && !files.length && !pastText && !pastFiles.length && !state.activeSubject) {
+    return toast('请先粘贴大纲或上传大纲 / 真题文档，再保存到科目库', true);
   }
 
   try {
@@ -849,6 +1028,8 @@ async function saveSubject() {
         outline: { text: outline, files, coverage: (state.outlineMeta && state.outlineMeta.coverage) || [] },
         analysis: { specs: activeSpecs() },
         realExam: state.realExam || undefined,
+        // 历年真题原文：粘贴的内容直接归档；仅上传文件时由档案里的原文继续保留
+        pastPaper: pastText ? { text: pastText, files: pastFiles, mode: $('#pastPaperMode').value } : undefined,
       }),
     });
     await loadSubjects(subject.id);
@@ -901,6 +1082,7 @@ async function generateFromSubject(subject) {
         realExamYears: $('#realExamYears').value.trim() || '近 5 年',
         realExamRatio: Number($('#realExamRatio').value) || 50,
         ...historyPayload(),
+        ...pastPaperPayload(),
       }),
     });
     state.generated = data.paper;
@@ -931,23 +1113,28 @@ async function generateFromSubject(subject) {
 function onFileAction(e) {
   const btn = e.target.closest('button[data-act="remove"]');
   if (!btn) return;
-  const idx = Number(btn.closest('.file-item').dataset.index);
-  state.outlineFiles.splice(idx, 1);
-  renderFileList();
+  const item = btn.closest('.file-item');
+  if (!item) return;
+  const kind = item.dataset.kind === 'past-paper' ? 'past-paper' : 'outline';
+  bucketOf(kind).splice(Number(item.dataset.index), 1);
+  renderFileList(kind);
 }
 
-function renderFileList() {
-  const el = $('#fileList');
-  if (!state.outlineFiles.length) {
+function renderFileList(kind = 'outline') {
+  const el = fileListElOf(kind);
+  const bucket = bucketOf(kind);
+  if (!bucket.length) {
     el.innerHTML = '';
     return;
   }
-  el.innerHTML = state.outlineFiles
+  el.innerHTML = bucket
     .map(
       (f, i) => `
-    <div class="file-item ${f.ok === false ? 'bad' : ''}" data-index="${i}">
+    <div class="file-item ${f.ok === false ? 'bad' : ''}" data-index="${i}" data-kind="${kind}">
       <span class="n" title="${esc(f.name)}">${esc(f.name)}</span>
-      <span class="s">${humanSize(f.size)}${f.chars === null ? ' · 解析中…' : ` · ${f.chars} 字`}</span>
+      <span class="s">${humanSize(f.size)}${
+        f.chars === null ? ' · 解析中…' : ` · ${f.chars} 字${f.docId ? ' · 已入库' : ''}`
+      }</span>
       ${f.error ? `<span class="s err">${esc(f.error)}</span>` : ''}
       <button class="ghost small" data-act="remove">移除</button>
     </div>`
@@ -968,7 +1155,9 @@ async function generatePaper() {
   if (!specs.length) return toast('请至少选择一种题型并设置题量', true);
 
   const useRealExam = $('#useRealExam').checked;
-  busy(useRealExam ? 'AI 正在检索历年真题并命题…' : 'AI 正在命题，请稍候…');
+  const pp = pastPaperPayload();
+  const pastTip = pp.pastPaperText || pp.pastDocIds.length ? '（学习历年真题的提问方式）' : '';
+  busy(useRealExam ? `AI 正在检索历年真题并命题${pastTip}…` : `AI 正在命题${pastTip}，请稍候…`);
   try {
     const { paper, realExam, warnings } = await api('/papers', {
       method: 'POST',
@@ -979,6 +1168,7 @@ async function generatePaper() {
         specs,
         ...realExamPayload(),
         ...historyPayload(),
+        ...pp,
       }),
     });
     state.generated = paper;
@@ -1024,9 +1214,18 @@ async function generateFromOutline(subject) {
     fd.append('historyRatio', String(h.historyRatio));
     fd.append('historyLimit', String(h.historyLimit));
   }
+
+  // 历年真题：粘贴原文 + 已解析入库的真题文档（docId 复用，无需重复上传）
+  const pp = pastPaperPayload();
+  if (pp.usePastPaper || pp.pastPaperText) fd.append('usePastPaper', '1');
+  if (pp.pastPaperText) fd.append('pastPaperText', pp.pastPaperText);
+  if (pp.pastDocIds.length) fd.append('pastDocIds', JSON.stringify(pp.pastDocIds));
+  fd.append('pastPaperMode', pp.pastPaperMode);
+
   state.outlineFiles.forEach((f) => fd.append('files', f.file, f.name));
 
-  busy(p.useRealExam ? 'AI 正在检索历年真题并依据大纲命题…' : 'AI 正在阅读大纲并命题…');
+  const pastTip = pp.pastPaperText || pp.pastDocIds.length ? '（学习历年真题的提问方式）' : '';
+  busy(p.useRealExam ? `AI 正在检索历年真题并依据大纲命题${pastTip}…` : `AI 正在阅读大纲并命题${pastTip}…`);
   try {
     const data = await api('/papers/from-outline', { method: 'POST', body: fd });
     state.generated = data.paper;
@@ -1054,10 +1253,18 @@ async function generateFromOutline(subject) {
 
 function outlineMetaHTML() {
   const m = state.outlineMeta;
-  if (!m) return '';
+  const pp = state.generated && state.generated.pastPaper;
+  const past = pp
+    ? `<div class="analysis"><b>历年真题参考：</b>${(pp.files || [])
+        .map((f) => `${esc(f.name)}（${f.chars} 字）`)
+        .join('、')} · ${pp.mode === 'mix' ? '提问方式 + 真题考点并重' : '重点学习提问方式'}${
+        pp.truncated ? '（原文过长已截取）' : ''
+      }</div>`
+    : '';
+  if (!m) return past;
   const files = (m.files || []).map((f) => `${esc(f.name)}（${f.chars} 字）`).join('、');
   const cov = (m.coverage || []).map((c) => `<span class="chip-item">${esc(c)}</span>`).join('');
-  return `
+  return `${past}
     ${files ? `<div class="analysis"><b>大纲来源：</b>${files}${m.truncated ? '（内容过长，已截断）' : ''}</div>` : ''}
     ${(m.warnings || []).length ? `<div class="comment"><b>提示：</b>${esc(m.warnings.join('；'))}</div>` : ''}
     ${cov ? `<div class="side-head"><h2>已覆盖知识点</h2></div><div class="chips">${cov}</div>` : ''}`;
@@ -1187,7 +1394,7 @@ function renderPaperList() {
           <div class="list-item ${activeId === p.id ? 'active' : ''}" data-paper="${p.id}">
             <div class="t">${esc(p.title)}</div>
             <div class="m">${p.questionCount} 题 · ${p.totalPoints} 分 · ${esc(p.difficulty)}</div>
-            <div class="m">${new Date(p.createdAt).toLocaleString('zh-CN')}</div>
+            <div class="m ${p.stats ? 'done' : ''}">${attemptLine(p.stats)}</div>
           </div>`
             )
             .join('')}
@@ -1210,15 +1417,41 @@ function renderPaperList() {
 
 async function openPaper(id) {
   try {
-    const { paper } = await api(`/papers/${id}?mode=exam`);
-    state.paper = paper;
+    const [paperRes, subRes] = await Promise.all([
+      api(`/papers/${id}?mode=exam`),
+      api(`/submissions?paperId=${encodeURIComponent(id)}`).catch(() => ({ submissions: [] })),
+    ]);
+    state.paper = paperRes.paper;
+    state.paperSubmissions = subRes.submissions || [];
     state.answers = {};
     state.result = null;
+    state.viewingHistory = false;
     renderPaperList();
     renderExam();
   } catch (e) {
     toast(e.message, true);
   }
+}
+
+/** 试卷的做题情况：已做 N 次 · 最近 X 分（时间）· 最好 Y 分 */
+function attemptLine(stats) {
+  if (!stats || !stats.attempts) return '未作答';
+  return `已做 ${stats.attempts} 次 · 最近 ${stats.lastScore}/${stats.lastTotalScore} 分 · ${fmtTime(stats.lastAt)}`;
+}
+
+/** 后台评卷完成后，刷新当前试卷的历次答卷 */
+async function refreshPaperSubmissions(paperId) {
+  try {
+    const { submissions } = await api(`/submissions?paperId=${encodeURIComponent(paperId)}`);
+    state.paperSubmissions = submissions || [];
+  } catch (_) {
+    /* 刷新失败不影响结果展示 */
+  }
+}
+
+/** 当前试卷的历史记录（最近 10 条） */
+function currentPaperStats() {
+  return (state.papers.find((p) => p.id === (state.paper && state.paper.id)) || {}).stats || null;
 }
 
 function renderExam() {
@@ -1233,18 +1466,66 @@ function renderExam() {
     return;
   }
   const total = p.questions.reduce((s, q) => s + q.points, 0);
+  const stats = currentPaperStats();
+  const grading = Boolean(state.grading && state.grading.paperId === p.id);
   pane.innerHTML = `
+    ${grading ? `<div class="card" id="gradingBar">${gradingBarHTML()}</div>` : ''}
     <div class="card">
       <div class="side-head">
         <div>
           <h2>${esc(p.title)}</h2>
           <div class="hint">${p.questions.length} 题 · 共 ${total} 分 · 建议用时 ${p.duration} 分钟</div>
+          ${
+            stats
+              ? `<div class="hint">${attemptLine(stats)}${
+                  stats.attempts > 1 ? ` · 最好 ${stats.bestScore} 分 · 平均正确率 ${stats.avgAccuracy}%` : ''
+                }</div>`
+              : ''
+          }
         </div>
-        <button class="primary" id="btnSubmitExam">提交并评卷</button>
+        <button class="primary" id="btnSubmitExam" ${grading ? 'disabled' : ''}>
+          ${grading ? '后台评卷中…' : '提交并评卷'}
+        </button>
       </div>
       ${p.questions.map((q, i) => questionExamHTML(q, i)).join('')}
-    </div>`;
+    </div>
+    ${paperAttemptsHTML()}`;
   $('#btnSubmitExam').addEventListener('click', submitExam);
+}
+
+/* ------------------------------ 后台评卷 ------------------------------ */
+
+/** 提交后由服务端后台排队评卷：这里只负责展示进度，不再阻塞页面 */
+function gradingBarHTML() {
+  const g = state.grading;
+  if (!g) return '';
+  const seconds = Math.round((Date.now() - (g.startedAt || Date.now())) / 1000);
+  const where = g.status === 'queued' ? `队列中第 ${g.position} 位（前面还有 ${g.waiting - 1} 个任务）` : 'AI 正在评卷';
+  const prog = g.progress ? ` · ${g.progress.phase} · 已输出 ${g.progress.chars} 字` : '';
+  return `
+    <div class="grading-bar">
+      <div class="spinner small"></div>
+      <div class="g-text">
+        <div class="g-title">已提交，服务端后台评卷中（同一时刻只评一份，其余排队）</div>
+        <div class="g-meta">${esc(where)} · 已等待 ${seconds} 秒${esc(prog)}</div>
+      </div>
+    </div>`;
+}
+
+/** 只刷新进度条本身，避免重绘整页打断作答 */
+function renderGradingBar() {
+  const el = $('#gradingBar');
+  if (el) el.innerHTML = gradingBarHTML();
+  updateQueueTag();
+}
+
+/** 顶栏提示：切到其他页也能看到还有评卷在跑 */
+function updateQueueTag() {
+  const tag = $('#queueTag');
+  if (!tag) return;
+  const g = state.grading;
+  tag.classList.toggle('hidden', !g);
+  tag.textContent = !g ? '' : g.status === 'running' ? '后台评卷中…' : `评卷排队中（第 ${g.position} 位）`;
 }
 
 function questionExamHTML(q, i) {
@@ -1310,9 +1591,12 @@ function onAnswerInput(e) {
   }
 }
 
+/** 提交答卷：服务端立即入队返回任务 id，评卷在后台串行执行，页面不再等待 */
 async function submitExam() {
   const p = state.paper;
   if (!p) return;
+  if (state.grading && state.grading.paperId === p.id) return toast('该答卷已在后台评卷，请稍候', true);
+
   const unanswered = p.questions.filter((q) => {
     const a = state.answers[q.id];
     if (a == null || a === '') return true;
@@ -1320,20 +1604,113 @@ async function submitExam() {
   });
   if (unanswered.length && !confirm(`还有 ${unanswered.length} 道题未作答，确定提交吗？`)) return;
 
-  busy('AI 正在评卷…');
   try {
-    const { submission } = await api(`/papers/${p.id}/grade`, {
+    const data = await api(`/papers/${p.id}/grade`, {
       method: 'POST',
       body: JSON.stringify({ answers: state.answers }),
     });
-    state.result = submission;
+    const job = data.job || {};
+    state.grading = {
+      jobId: job.id,
+      paperId: p.id,
+      status: job.status || 'queued',
+      position: job.position || 1,
+      waiting: job.waiting || 1,
+      progress: job.progress || null,
+      startedAt: Date.now(),
+      fails: 0,
+    };
     renderExam();
-    loadMistakes();
-    toast('评卷完成');
+    startGradingPoll();
+    toast(data.duplicated ? '该试卷有评卷任务在进行中，已接入原任务' : '已提交，服务端后台排队评卷');
   } catch (e) {
     toast(e.message, true);
+  }
+}
+
+let gradingTimer = null;
+let gradingBusy = false;
+/** 连续查询失败这么多次后放弃（避免服务不可用时无限轮询） */
+const GRADING_MAX_FAILS = 20;
+
+function startGradingPoll() {
+  stopGradingPoll();
+  gradingTimer = setInterval(pollGrading, 2000);
+  updateQueueTag();
+  pollGrading();
+}
+
+function stopGradingPoll() {
+  clearInterval(gradingTimer);
+  gradingTimer = null;
+}
+
+/** 轮询后台评卷任务；完成后直接把结果渲染到答题页 */
+async function pollGrading() {
+  if (!state.grading) return stopGradingPoll();
+  if (gradingBusy) return;
+  gradingBusy = true;
+  try {
+    const data = await api(`/jobs/${state.grading.jobId}`);
+    const job = data.job;
+    const g = state.grading;
+    if (!job) {
+      state.grading = null;
+      stopGradingPoll();
+      updateQueueTag();
+      if (state.view === 'exam') renderExam();
+      return;
+    }
+
+    g.status = job.status;
+    g.position = job.position;
+    g.waiting = job.waiting;
+    g.progress = job.progress || null;
+
+    if (job.status === 'done') {
+      state.grading = null;
+      stopGradingPoll();
+      const submission = data.submission || null;
+      // 只有仍停留在同一份试卷时才切到结果页，否则只刷新列表与提示
+      const mine = Boolean(submission && state.paper && state.paper.id === submission.paperId);
+      if (mine) {
+        state.result = submission;
+        state.viewingHistory = false;
+      }
+      loadPapers();
+      loadMistakes();
+      loadHistory();
+      if (mine) refreshPaperSubmissions(submission.paperId);
+      if (state.view === 'exam') renderExam();
+      updateQueueTag();
+      const masteredCount = data.mastered || 0;
+      const masteredTip = masteredCount ? `，消灭错题 ${masteredCount} 道` : '';
+      toast(mine ? `评卷完成${masteredTip}` : `评卷完成${masteredTip}，可在「做题历史」查看结果`);
+      return;
+    }
+
+    if (job.status === 'error') {
+      state.grading = null;
+      stopGradingPoll();
+      if (state.view === 'exam') renderExam();
+      updateQueueTag();
+      toast(job.error || '评卷失败', true);
+      return;
+    }
+
+    renderGradingBar();
+  } catch (e) {
+    if (!state.grading) return;
+    state.grading.fails = (state.grading.fails || 0) + 1;
+    if (state.grading.fails >= GRADING_MAX_FAILS) {
+      state.grading = null;
+      stopGradingPoll();
+      if (state.view === 'exam') renderExam();
+      updateQueueTag();
+      toast('评卷进度查询失败，请稍后到「做题历史」查看结果', true);
+    }
   } finally {
-    idle();
+    gradingBusy = false;
   }
 }
 
@@ -1349,14 +1726,17 @@ function renderResult() {
         </div>
         <div class="score-text">
           <div><b>正确率 ${r.accuracy}%</b> · 答对 ${r.correctCount} / ${r.questionCount} 题</div>
-          <div class="hint">${esc(r.summary || '')}</div>
+          <div class="hint">${r.createdAt ? `${fmtTime(r.createdAt)} · ` : ''}${esc(r.summary || '')}</div>
         </div>
       </div>
       ${chips ? `<div class="side-head"><h2>薄弱知识点</h2></div><div class="chips">${chips}</div>` : ''}
       ${r.advice ? `<div class="analysis"><b>复习建议：</b>${esc(r.advice)}</div>` : ''}
       <div class="actions" style="margin:16px 0">
         <button class="ghost" id="btnRetry">重新作答</button>
-        <span class="total">错题已自动收入错题本，可在「错题本」中改错</span>
+        ${state.viewingHistory ? `<button class="ghost" id="btnBackHistory">返回做题历史</button>` : ''}
+        <span class="total">错题已自动收入错题本，可在「错题本」中改错${
+          r.masteredCount ? `；本次做对并消灭错题 ${r.masteredCount} 道（含同知识点的错题）` : ''
+        }</span>
       </div>
     </div>
     <div class="card">
@@ -1365,9 +1745,12 @@ function renderResult() {
     </div>`;
   $('#btnRetry').addEventListener('click', () => {
     state.result = null;
+    state.viewingHistory = false;
     state.answers = {};
     renderExam();
   });
+  const back = $('#btnBackHistory');
+  if (back) back.addEventListener('click', () => switchView('history'));
 }
 
 function resultItemHTML(d, i) {
@@ -1391,6 +1774,13 @@ function resultItemHTML(d, i) {
         <span class="q-type">${TYPE_LABELS[d.type] || d.type}</span>
         <span class="tag ${d.isCorrect ? 'ok' : 'no'}">${d.score} / ${d.points} 分</span>
         ${d.byAI ? `<span class="tag">AI 评分</span>` : ''}
+        ${
+          d.knowledgeMastered > 1
+            ? `<span class="tag ok" title="做对本题后，错题本中同知识点的错题已标记为已掌握">知识点已掌握 · 消灭 ${d.knowledgeMastered} 道错题</span>`
+            : d.mistakeMastered
+            ? `<span class="tag ok" title="这道题已在错题本中标记为已掌握">错题已掌握</span>`
+            : ''
+        }
         ${d.knowledge ? `<span class="tag">${esc(d.knowledge)}</span>` : ''}
       </div>
       <div class="q-stem">${esc(d.stem)}</div>
@@ -1404,6 +1794,176 @@ function resultItemHTML(d, i) {
       ${d.comment ? `<div class="comment"><b>点评：</b>${esc(d.comment)}</div>` : ''}
       ${d.analysis ? `<div class="analysis"><b>解析：</b>${esc(d.analysis)}</div>` : ''}
     </div>`;
+}
+
+/* ------------------------------ 做题历史 ------------------------------ */
+
+async function loadHistory() {
+  try {
+    state.history = await api('/history');
+    if (state.view === 'history') renderHistory();
+  } catch (_) {
+    /* 忽略 */
+  }
+}
+
+/** 一次做题记录：得分 / 正确率 / 做题时间 / 查看 */
+function historyRowHTML(s, withSubject = true) {
+  const title = s.paperTitle || '试卷';
+  return `
+    <div class="history-row">
+      <div class="h-main">
+        <div class="h-title" title="${esc(title)}">${esc(title)}</div>
+        <div class="h-meta">${withSubject ? `${esc(subjectOf(s))} · ` : ''}答对 ${s.correctCount ?? 0} / ${
+    s.questionCount ?? 0
+  } 题 · 正确率 ${s.accuracy ?? 0}%</div>
+      </div>
+      <div class="h-col">
+        <div class="h-k">得分</div>
+        <div class="h-score">${s.earnedScore}<span class="h-total"> / ${s.totalScore}</span></div>
+      </div>
+      <div class="h-col">
+        <div class="h-k">做题时间</div>
+        <div class="h-time">${fmtTime(s.createdAt)}</div>
+      </div>
+      <button class="ghost small" data-act="view" data-sub="${s.id}" data-paper="${s.paperId || ''}">查看</button>
+    </div>`;
+}
+
+/** 科目维度：做题次数 / 最近做题时间 / 最近成绩 */
+function subjectRowHTML(s) {
+  return `
+    <div class="history-row">
+      <div class="h-main">
+        <div class="h-title">${esc(s.subject)}</div>
+        <div class="h-meta">做题 ${s.attempts} 次 · ${s.papers} 份试卷 · 平均正确率 ${s.avgAccuracy}% · 最好 ${
+    s.bestScore
+  } 分</div>
+      </div>
+      <div class="h-col">
+        <div class="h-k">最近成绩</div>
+        <div class="h-score">${s.lastScore}<span class="h-total"> / ${s.lastTotalScore}</span></div>
+      </div>
+      <div class="h-col">
+        <div class="h-k">最近做题</div>
+        <div class="h-time">${fmtTime(s.lastAt)}</div>
+      </div>
+    </div>`;
+}
+
+/** 当前试卷的历史做题记录（答题页底部） */
+function paperAttemptsHTML() {
+  const list = state.paperSubmissions || [];
+  if (!list.length) return '';
+  const sorted = [...list].sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+  return `
+    <div class="card">
+      <div class="side-head">
+        <h2>本卷做题记录</h2>
+        <span class="hint">共 ${sorted.length} 次</span>
+      </div>
+      ${sorted.map((s) => historyRowHTML(s, false)).join('')}
+    </div>`;
+}
+
+function renderHistory() {
+  const el = $('#historyPane');
+  const h = state.history;
+  if (!h) return;
+  const { overview, bySubject, records } = h;
+
+  if (!records.length) {
+    $('#historySubjectNav').innerHTML = '';
+    el.innerHTML = `<div class="card"><div class="empty">还没有做题记录，先去「答题评卷」做一份试卷吧</div></div>`;
+    return;
+  }
+
+  // 左栏科目导航：按做题次数排序，点击只看该科目
+  if (state.historySubject && !bySubject.some((s) => s.subject === state.historySubject)) {
+    state.historySubject = '';
+  }
+  renderSubjectNav(
+    $('#historySubjectNav'),
+    bySubject.map((s) => ({ name: s.subject, count: s.attempts })),
+    state.historySubject,
+    (name) => {
+      state.historySubject = name;
+      renderHistory();
+    }
+  );
+
+  const subjectRows = state.historySubject ? bySubject.filter((s) => s.subject === state.historySubject) : bySubject;
+  const rows = state.historySubject ? records.filter((r) => subjectOf(r) === state.historySubject) : records;
+
+  el.innerHTML = `
+    <div class="card">
+      <div class="side-head">
+        <h2>做题总览</h2>
+        <span class="hint">累计 ${overview.attempts} 次</span>
+      </div>
+      <div class="stat-grid">
+        <div class="stat-box">
+          <div class="k">做题次数</div>
+          <div class="v">${overview.attempts}</div>
+          <div class="s">${overview.papers} 份试卷 · ${overview.subjects} 个科目</div>
+        </div>
+        <div class="stat-box">
+          <div class="k">最近成绩</div>
+          <div class="v">${overview.lastScore ?? '—'}<span class="v-sub"> / ${overview.lastTotalScore ?? '—'}</span></div>
+          <div class="s">正确率 ${overview.lastAccuracy ?? '—'}%</div>
+        </div>
+        <div class="stat-box">
+          <div class="k">最近做题时间</div>
+          <div class="v v-sm">${fmtTime(overview.lastAt) || '—'}</div>
+          <div class="s" title="${esc(overview.lastPaperTitle || '')}">${esc(overview.lastPaperTitle || '')}</div>
+        </div>
+        <div class="stat-box">
+          <div class="k">平均正确率</div>
+          <div class="v">${overview.avgAccuracy}%</div>
+          <div class="s">全部记录平均</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="side-head">
+        <h2>按科目统计</h2>
+        <span class="hint">做题次数 · 最近做题时间 · 最近成绩</span>
+      </div>
+      ${subjectRows.map((s) => subjectRowHTML(s)).join('')}
+    </div>
+
+    <div class="card">
+      <div class="side-head">
+        <h2>做题记录</h2>
+        <span class="hint">共 ${rows.length} 条${state.historySubject ? `（${esc(state.historySubject)}）` : ''}</span>
+      </div>
+      ${rows.map((r) => historyRowHTML(r)).join('')}
+    </div>`;
+}
+
+/** 打开某次历史答卷：载入该次结果与对应试卷，在答题页展示 */
+async function openSubmission(subId, paperId) {
+  if (!subId) return;
+  try {
+    const [subRes, paperRes] = await Promise.all([
+      api(`/submissions/${subId}`),
+      paperId ? api(`/papers/${paperId}`).catch(() => ({ paper: null })) : Promise.resolve({ paper: null }),
+    ]);
+    if (paperRes.paper) state.paper = paperRes.paper;
+    state.result = subRes.submission;
+    state.viewingHistory = true;
+    switchView('exam');
+    renderExam();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+function onHistoryClick(e) {
+  const btn = e.target.closest('button[data-act="view"]');
+  if (!btn) return;
+  openSubmission(btn.dataset.sub, btn.dataset.paper);
 }
 
 /* ------------------------------ 错题本 ------------------------------ */
@@ -1426,7 +1986,38 @@ function visibleMistakes() {
   return state.mistakes;
 }
 
-/** 错题本：按科目分组，未掌握多的科目排前面 */
+/** 取错题的知识点，缺失则归为「未标注知识点」 */
+function knowledgeOf(m) {
+  return String(m.knowledge || m.question?.knowledge || '').trim() || UNKNOWN_KNOWLEDGE;
+}
+
+/**
+ * 生成知识点分组函数：把细碎、互相包含的知识点合并到更宽泛（更短）的那一个，
+ * 例如「中国式现代化中国特色」并入「中国式现代化」，避免一组只有一道题。
+ */
+function knowledgeKeyOf(list) {
+  const names = [...new Set(list.map(knowledgeOf))]
+    .filter((n) => n !== UNKNOWN_KNOWLEDGE)
+    .sort((a, b) => a.length - b.length);
+  const alias = new Map();
+  names.forEach((name, i) => {
+    const lower = name.toLowerCase();
+    for (let j = 0; j < i; j += 1) {
+      const short = names[j];
+      // 较短者至少 3 个字，避免「党」这类单字知识点吞掉一堆题目
+      if (short.length >= 3 && lower.includes(short.toLowerCase())) {
+        alias.set(name, short);
+        return;
+      }
+    }
+  });
+  return (m) => {
+    const k = knowledgeOf(m);
+    return alias.get(k) || k;
+  };
+}
+
+/** 错题本：先按科目分组，科目内再按知识点分组（同一知识点的错题合并为一组） */
 function renderMistakes() {
   const el = $('#mistakeList');
   const list = visibleMistakes();
@@ -1434,6 +2025,10 @@ function renderMistakes() {
     el.innerHTML = `<div class="empty">暂无错题。完成评卷后，错题会自动进入这里。</div>`;
     return;
   }
+
+  const keyOf = knowledgeKeyOf(list);
+  const timeOf = (m) => new Date(m.lastWrongAt || m.createdAt || 0).getTime();
+  const byTime = (a, b) => timeOf(b) - timeOf(a);
 
   // 科目导航 + 按科目过滤
   const counts = new Map();
@@ -1450,37 +2045,74 @@ function renderMistakes() {
     renderMistakes();
   });
 
-  const groups = new Map();
+  // 科目 → 知识点 两级分组
+  const bySubject = new Map();
   for (const m of list) {
-    const key = subjectOf(m);
-    if (state.mistakeSubject && key !== state.mistakeSubject) continue;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(m);
+    const subject = subjectOf(m);
+    if (state.mistakeSubject && subject !== state.mistakeSubject) continue;
+    if (!bySubject.has(subject)) bySubject.set(subject, []);
+    bySubject.get(subject).push(m);
   }
-  if (!groups.size) {
+  if (!bySubject.size) {
     el.innerHTML = `<div class="empty">该科目下暂无错题</div>`;
     return;
   }
 
-  const ordered = [...groups.entries()]
+  const subjects = [...bySubject.entries()]
     .map(([subject, items]) => {
-      const sorted = [...items].sort(
-        (a, b) =>
-          new Date(b.lastWrongAt || b.createdAt || 0) - new Date(a.lastWrongAt || a.createdAt || 0)
-      );
+      const sorted = [...items].sort(byTime);
+
+      const byKnowledge = new Map();
+      for (const m of sorted) {
+        const k = keyOf(m);
+        if (!byKnowledge.has(k)) byKnowledge.set(k, []);
+        byKnowledge.get(k).push(m);
+      }
+      const knowledgeGroups = [...byKnowledge.entries()]
+        .map(([knowledge, ms]) => ({
+          knowledge,
+          items: ms,
+          unmastered: ms.filter((m) => !m.mastered).length,
+          latest: timeOf(ms[0]),
+        }))
+        .sort(
+          (a, b) =>
+            (a.knowledge === UNKNOWN_KNOWLEDGE ? 1 : 0) - (b.knowledge === UNKNOWN_KNOWLEDGE ? 1 : 0) ||
+            b.unmastered - a.unmastered ||
+            b.items.length - a.items.length ||
+            b.latest - a.latest
+        );
+
       return {
         subject,
         items: sorted,
         unmastered: sorted.filter((m) => !m.mastered).length,
-        latest: new Date(sorted[0].lastWrongAt || sorted[0].createdAt || 0).getTime(),
+        latest: timeOf(sorted[0]),
+        knowledgeGroups,
       };
     })
-    .sort((a, b) => b.unmastered - a.unmastered || b.latest - a.latest);
+    .sort((a, b) => b.unmastered - a.unmastered || b.items.length - a.items.length || b.latest - a.latest);
 
-  el.innerHTML = ordered
-    .map(({ subject, items, unmastered }) => {
+  el.innerHTML = subjects
+    .map(({ subject, items, unmastered, knowledgeGroups }) => {
       const collapsed = Boolean(state.collapsedMistakeSubjects[subject]);
       const count = `${items.length} 题${unmastered ? ` · 未掌握 ${unmastered}` : ''}`;
+      const inner = knowledgeGroups
+        .map((g) => {
+          const key = `${subject}::${g.knowledge}`;
+          const kCollapsed = Boolean(state.collapsedMistakeKnowledges[key]);
+          const kCount = `${g.items.length} 题${g.unmastered ? ` · 未掌握 ${g.unmastered}` : ''}`;
+          return `
+        <div class="paper-group knowledge-group${kCollapsed ? ' collapsed' : ''}">
+          <div class="group-head" data-knowledge="${esc(key)}" title="同一知识点的错题：点击展开 / 收起">
+            <span class="arrow">▾</span>
+            <span class="gname">${esc(g.knowledge)}</span>
+            <span class="gcount">${kCount}</span>
+          </div>
+          <div class="group-body">${g.items.map(mistakeHTML).join('')}</div>
+        </div>`;
+        })
+        .join('');
       return `
       <div class="paper-group mistake-group${collapsed ? ' collapsed' : ''}">
         <div class="group-head" data-subject="${esc(subject)}" title="点击展开 / 收起">
@@ -1488,15 +2120,22 @@ function renderMistakes() {
           <span class="gname">${esc(subject)}</span>
           <span class="gcount">${count}</span>
         </div>
-        <div class="group-body">${items.map(mistakeHTML).join('')}</div>
+        <div class="group-body">${inner}</div>
       </div>`;
     })
     .join('');
 
-  $$('#mistakeList .group-head').forEach((head) =>
+  $$('#mistakeList .mistake-group > .group-head').forEach((head) =>
     head.addEventListener('click', () => {
       const key = head.dataset.subject;
       state.collapsedMistakeSubjects[key] = !state.collapsedMistakeSubjects[key];
+      renderMistakes();
+    })
+  );
+  $$('#mistakeList .knowledge-group > .group-head').forEach((head) =>
+    head.addEventListener('click', () => {
+      const key = head.dataset.knowledge;
+      state.collapsedMistakeKnowledges[key] = !state.collapsedMistakeKnowledges[key];
       renderMistakes();
     })
   );
@@ -1516,6 +2155,11 @@ function mistakeHTML(m) {
       <span class="q-type">${TYPE_LABELS[q.type] || ''}</span>
       <span class="tag">${esc(m.subject || '')}</span>
       <span class="tag ${m.mastered ? 'ok' : 'no'}">${m.mastered ? '已掌握' : `错 ${m.wrongTimes || 1} 次`}</span>
+      ${
+        m.mastered && m.masteredByKnowledge
+          ? `<span class="tag" title="做对同知识点的题目后自动掌握">知识点「${esc(m.masteredByKnowledge)}」做对后自动掌握</span>`
+          : ''
+      }
       <span class="q-points">来自：${esc(m.paperTitle || '')}</span>
     </div>
     <div class="q-stem">${esc(q.stem || '')}</div>

@@ -201,6 +201,37 @@ ${demands ? `答案组织要求：\n${demands}` : ''}
 }
 
 /**
+ * 把用户上传的「历年真题原文」渲染成命题 prompt 片段（重点是学习提问方式）。
+ * pastPaper: { text, files: [{ name, chars }], truncated, mode: 'style' | 'mix' }
+ */
+export function buildPastPaperSection(pastPaper, totalQuestions) {
+  const text = String(pastPaper?.text || '').trim();
+  if (!text) return '';
+
+  const files = (pastPaper.files || []).filter((f) => f?.name);
+  const total = Number(totalQuestions) || 0;
+  const mix = pastPaper.mode === 'mix';
+  const pastCount = mix && total ? Math.max(1, Math.round(total * 0.6)) : 0;
+
+  return `
+【历年真题原文（用户上传，用于学习提问方式）】
+${files.length ? `真题来源：${files.map((f) => `${f.name}${f.chars ? `（${f.chars} 字）` : ''}`).join('、')}\n` : ''}真题原文共 ${text.length} 字${pastPaper.truncated ? '（内容过长，已截断）' : ''}
+
+---- 历年真题原文开始 ----
+${text}
+---- 历年真题原文结束 ----
+
+【真题学习要求（重点：学习提问方式）】
+1. 先通读上面的真题，逐题分析它们的**提问方式**：题干怎么开头、用什么指令词、从哪个角度设问、选项如何设置、答案要求写到什么程度、各题型的分值配比如何。
+2. 命题时模仿真题的提问方式与措辞习惯，让生成的题目「像这份真题」——像的不只是考点，而是问法：选择题的设问角度、填空题的表述方式、简答 / 论述题的作答要求都要向真题靠拢；同一考点不要反复使用同一种问法。
+3. 严禁照抄真题的题干、选项、材料与数据：人名、数值、情境、材料必须重新设计；可以借鉴问法与角度，不得复制原题。
+4. 真题中出现过的知识点优先考查${
+    mix ? `，约 ${pastCount || '六成'} 道题围绕真题考过的考点展开` : ''
+  }；若某道真题的考点超出本次大纲 / 科目范围，只借鉴它的问法，不考这些超纲内容。
+5. 每道题的 knowledge 字段写明所考知识点，便于核对与真题的对应关系。`;
+}
+
+/**
  * 把「同科目历史试卷」渲染成避重 prompt 片段。
  * history: { papers, questions, lines }；newRate：要求的新题（不重复）占比，默认 40。
  */
@@ -223,7 +254,7 @@ ${lines}
 3. 生成前先逐条比对上面的题干；只要与题干表达高度接近（含只改数字、只换选项顺序）就算重复，必须重写。`;
 }
 
-export function buildGeneratePrompt({ subject, difficulty, specs, notes, totalPoints, realExam, history, historyNewRate }) {
+export function buildGeneratePrompt({ subject, difficulty, specs, notes, totalPoints, realExam, pastPaper, history, historyNewRate }) {
   const specLines = specs
     .map((s) => `- ${TYPE_LABELS[s.type] || s.type} ${s.count} 道，每题 ${s.points} 分`)
     .join('\n');
@@ -237,6 +268,7 @@ ${specLines}
 - 全卷总分目标：约 ${totalPoints} 分
 - 附加要求：${notes || '无'}
 ${buildRealExamSection(realExam, totalQuestions)}
+${buildPastPaperSection(pastPaper, totalQuestions)}
 ${buildHistorySection(history, totalQuestions, historyNewRate)}
 输出 JSON 结构（严格遵守，questions 数组顺序为：单选 → 多选 → 判断 → 填空 → 名词解释 → 简答 → 辨析 → 材料分析 → 论述）：
 {
@@ -266,7 +298,7 @@ ${TYPE_GUIDE}
   return { system: PROPOSER_SYSTEM, user, temperature: 0.4 };
 }
 
-export function buildOutlinePrompt({ subject, difficulty, outline, notes, specs, totalPoints, realExam, history, historyNewRate }) {
+export function buildOutlinePrompt({ subject, difficulty, outline, notes, specs, totalPoints, realExam, pastPaper, history, historyNewRate }) {
   const specLines = (specs || [])
     .map((s) => `- ${TYPE_LABELS[s.type] || s.type} ${s.count} 道，每题 ${s.points} 分`)
     .join('\n');
@@ -288,6 +320,7 @@ ${specLines}
 ${outline}
 【大纲 / 题型要求原文结束】
 ${buildRealExamSection(realExam, totalQuestions)}
+${buildPastPaperSection(pastPaper, totalQuestions)}
 ${buildHistorySection(history, totalQuestions, historyNewRate)}
 输出 JSON 结构（严格遵守）：
 {
