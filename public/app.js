@@ -63,6 +63,15 @@ const state = {
   papers: [],
   generated: null,
   paper: null, // 当前答题试卷（exam 模式）
+  examIndex: 0, // 单题作答模式：当前第几题
+  // 单选 / 判断题作答后是否自动进入下一题（可在答题页切换，记忆在本地）
+  autoNext: (() => {
+    try {
+      return localStorage.getItem('exam.autoNext') !== '0';
+    } catch (_) {
+      return true;
+    }
+  })(),
   answers: {},
   result: null,
   grading: null, // 后台评卷任务：{ jobId, paperId, status, position, waiting, progress, startedAt, fails }
@@ -72,6 +81,14 @@ const state = {
   historySubject: '', // 做题历史左栏选中的科目（'' = 全部科目）
   mistakes: [],
   mistakeFilter: 'all',
+  // 复习 / 闪卡
+  reviewCards: [], // 全部卡片（含排期）
+  reviewStats: null,
+  reviewMode: 'today', // today | all
+  reviewSubject: '', // 左栏选中的科目
+  reviewSession: null, // { queue: [id], pos, done, known, fuzzy, forgot }
+  reviewById: new Map(),
+  reviewRevealed: false,
   variantAnswers: {},
   expanded: {},
   collapsedSubjects: {}, // 试卷列表「按科目」分组的折叠状态：{ [科目名]: true }
@@ -82,6 +99,11 @@ const state = {
 };
 
 const UNKNOWN_KNOWLEDGE = '未标注知识点';
+
+/** 答题卡签名（已答状态）；没变化就不重绘答题卡 */
+let qNavSig = '';
+/** 「答完自动下一题」的待执行定时器：radio 会同时触发 input 与 change，必须去重，否则会连跳两题 */
+let autoNextTimer = null;
 
 /** 取条目所属科目名，空则归为「未分类」 */
 function subjectOf(item) {
@@ -317,6 +339,7 @@ async function init() {
   loadModels();
   loadHistory();
   loadDocuments();
+  loadReviews();
 }
 
 function bindGlobal() {
@@ -365,10 +388,25 @@ function bindGlobal() {
 
   $('#examPane').addEventListener('input', onAnswerInput);
   $('#examPane').addEventListener('change', onAnswerInput);
+  $('#examPane').addEventListener('click', onExamClick); // 单题作答：上一题 / 下一题 / 题号跳转
 
-  $$('.filters .chip').forEach((chip) =>
+  // 单题作答：方向键左右切题（输入框内不拦截）
+  document.addEventListener('keydown', (e) => {
+    if (state.view !== 'exam' || state.result || !state.paper) return;
+    const tag = (e.target.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+    if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      gotoQuestion(state.examIndex - 1);
+    } else if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      gotoQuestion(state.examIndex + 1);
+    }
+  });
+
+  $$('#view-mistakes .filters .chip').forEach((chip) =>
     chip.addEventListener('click', () => {
-      $$('.filters .chip').forEach((c) => c.classList.remove('active'));
+      $$('#view-mistakes .filters .chip').forEach((c) => c.classList.remove('active'));
       chip.classList.add('active');
       state.mistakeFilter = chip.dataset.filter;
       renderMistakes();
@@ -378,6 +416,21 @@ function bindGlobal() {
   $('#mistakeList').addEventListener('input', onVariantInput);
   $('#mistakeList').addEventListener('change', onVariantInput);
   $('#mistakeList').addEventListener('click', onMistakeAction);
+
+  // 复习 / 闪卡
+  $('#btnRefreshReviews').addEventListener('click', loadReviews);
+  $('#btnSyncReviews').addEventListener('click', syncReviews);
+  $('#reviewPane').addEventListener('click', onReviewAction);
+  $$('#view-review .filters .chip').forEach((chip) =>
+    chip.addEventListener('click', () => {
+      $$('#view-review .filters .chip').forEach((c) => c.classList.remove('active'));
+      chip.classList.add('active');
+      state.reviewMode = chip.dataset.rmode;
+      state.reviewSession = null;
+      state.reviewRevealed = false;
+      renderReviews();
+    })
+  );
 }
 
 /** 侧边栏收起 / 展开：状态按视图分别记在 localStorage */
@@ -415,7 +468,7 @@ function initSideToggles() {
 function switchView(view) {
   state.view = view;
   $$('.tab').forEach((t) => t.classList.toggle('active', t.dataset.view === view));
-  ['generate', 'exam', 'history', 'mistakes'].forEach((v) => {
+  ['generate', 'exam', 'history', 'mistakes', 'review'].forEach((v) => {
     $('#view-' + v).classList.toggle('hidden', v !== view);
   });
   if (view === 'exam') {
@@ -424,6 +477,7 @@ function switchView(view) {
   }
   if (view === 'history') loadHistory();
   if (view === 'mistakes') loadMistakes();
+  if (view === 'review') loadReviews();
 }
 
 /* ------------------------------ 生成试卷 ------------------------------ */
@@ -1424,6 +1478,7 @@ async function openPaper(id) {
     state.paper = paperRes.paper;
     state.paperSubmissions = subRes.submissions || [];
     state.answers = {};
+    state.examIndex = 0;
     state.result = null;
     state.viewingHistory = false;
     renderPaperList();
@@ -1454,6 +1509,10 @@ function currentPaperStats() {
   return (state.papers.find((p) => p.id === (state.paper && state.paper.id)) || {}).stats || null;
 }
 
+/**
+ * 答题页：一次只显示一道题（单题作答），配合题号答题卡与上一题 / 下一题，
+ * 做题过程不需要整卷下滑；切换题目时会自动回到顶部。
+ */
 function renderExam() {
   const p = state.paper;
   const pane = $('#examPane');
@@ -1468,29 +1527,143 @@ function renderExam() {
   const total = p.questions.reduce((s, q) => s + q.points, 0);
   const stats = currentPaperStats();
   const grading = Boolean(state.grading && state.grading.paperId === p.id);
+  state.examIndex = Math.max(0, Math.min(p.questions.length - 1, state.examIndex || 0));
+  qNavSig = ''; // 整页重绘，答题卡签名失效
+  clearTimeout(autoNextTimer);
+  autoNextTimer = null;
+
   pane.innerHTML = `
     ${grading ? `<div class="card" id="gradingBar">${gradingBarHTML()}</div>` : ''}
     <div class="card">
       <div class="side-head">
         <div>
           <h2>${esc(p.title)}</h2>
-          <div class="hint">${p.questions.length} 题 · 共 ${total} 分 · 建议用时 ${p.duration} 分钟</div>
-          ${
-            stats
-              ? `<div class="hint">${attemptLine(stats)}${
-                  stats.attempts > 1 ? ` · 最好 ${stats.bestScore} 分 · 平均正确率 ${stats.avgAccuracy}%` : ''
-                }</div>`
-              : ''
-          }
+          <div class="hint">共 ${p.questions.length} 题 · ${total} 分 · 建议用时 ${p.duration} 分钟${
+            stats ? ` · ${attemptLine(stats)}` : ''
+          }</div>
         </div>
-        <button class="primary" id="btnSubmitExam" ${grading ? 'disabled' : ''}>
-          ${grading ? '后台评卷中…' : '提交并评卷'}
-        </button>
+        <div class="exam-tools">
+          <label class="check-line" title="单选题 / 判断题选择后自动进入下一题">
+            <input type="checkbox" id="autoNextToggle" ${state.autoNext ? 'checked' : ''} />
+            <span>答完自动下一题</span>
+          </label>
+          <button class="primary" id="btnSubmitExam" ${grading ? 'disabled' : ''}>
+            ${grading ? '后台评卷中…' : '提交并评卷'}
+          </button>
+        </div>
       </div>
-      ${p.questions.map((q, i) => questionExamHTML(q, i)).join('')}
+      ${qNavHTML()}
+      <div id="qPane">${questionPaneHTML()}</div>
+      ${examFooterHTML()}
     </div>
     ${paperAttemptsHTML()}`;
   $('#btnSubmitExam').addEventListener('click', submitExam);
+  const autoNext = $('#autoNextToggle');
+  if (autoNext) {
+    autoNext.addEventListener('change', (e) => {
+      state.autoNext = e.target.checked;
+      try {
+        localStorage.setItem('exam.autoNext', state.autoNext ? '1' : '0');
+      } catch (_) {
+        /* 忽略存储失败 */
+      }
+    });
+  }
+}
+
+/** 某题是否已作答 */
+function isAnswered(q) {
+  const a = state.answers[q.id];
+  if (a == null || a === '') return false;
+  if (Array.isArray(a)) return a.some((x) => String(x).trim() !== '');
+  return String(a).trim() !== '';
+}
+
+/** 题号答题卡：已作答 / 当前题高亮，点击跳转 */
+function qNavHTML() {
+  const p = state.paper;
+  const idx = state.examIndex;
+  const answered = p.questions.filter(isAnswered).length;
+  return `
+    <div class="q-nav-wrap">
+      <div class="q-nav" id="qNav">
+        ${p.questions
+          .map(
+            (q, i) =>
+              `<button class="q-dot ${isAnswered(q) ? 'done' : ''} ${i === idx ? 'cur' : ''}" data-act="goto" data-i="${i}" title="第 ${
+                i + 1
+              } 题 · ${isAnswered(q) ? '已作答' : '未作答'}">${i + 1}</button>`
+          )
+          .join('')}
+      </div>
+      <div class="q-nav-meta">已答 <b>${answered}</b> / ${p.questions.length} 题</div>
+    </div>`;
+}
+
+/** 当前题的内容 */
+function questionPaneHTML() {
+  const p = state.paper;
+  const i = state.examIndex;
+  return `<div class="single-q">${questionExamHTML(p.questions[i], i)}</div>`;
+}
+
+/** 底部导航：上一题 / 下一题（最后一题变成交卷） */
+function examFooterHTML() {
+  const p = state.paper;
+  const i = state.examIndex;
+  const isFirst = i === 0;
+  const isLast = i >= p.questions.length - 1;
+  const grading = Boolean(state.grading && state.grading.paperId === p.id);
+  return `
+    <div class="exam-footer" id="examFooter">
+      <button class="ghost" data-act="prev" ${isFirst ? 'disabled' : ''}>上一题</button>
+      <span class="hint">第 ${i + 1} / ${p.questions.length} 题</span>
+      ${
+        isLast
+          ? `<button class="primary" data-act="submit" ${grading ? 'disabled' : ''}>提交并评卷</button>`
+          : `<button class="primary" data-act="next">下一题</button>`
+      }
+    </div>`;
+}
+
+/** 切到第 i 题：只重绘题目区、答题卡与底部导航，不整页重绘 */
+function gotoQuestion(i) {
+  const p = state.paper;
+  if (!p || state.result) return;
+  clearTimeout(autoNextTimer); // 手动切题时取消待执行的自动跳转
+  autoNextTimer = null;
+  const next = Math.max(0, Math.min(p.questions.length - 1, Number(i) || 0));
+  const qPane = $('#qPane');
+  if (!qPane) return renderExam();
+
+  state.examIndex = next;
+  qPane.innerHTML = questionPaneHTML();
+  const wrap = $('.q-nav-wrap');
+  if (wrap) wrap.outerHTML = qNavHTML();
+  const foot = $('#examFooter');
+  if (foot) foot.outerHTML = examFooterHTML();
+  scrollExamTop();
+}
+
+function scrollExamTop() {
+  const pane = $('#examPane');
+  const col = pane && pane.closest('.main-col');
+  if (col) col.scrollTo({ top: 0, behavior: 'smooth' });
+  else window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+/** 答题页的按钮事件（题号跳转 / 上一题 / 下一题 / 交卷） */
+function onExamClick(e) {
+  const btn = e.target.closest('[data-act]');
+  if (!btn) return;
+  const act = btn.dataset.act;
+  if (!['goto', 'prev', 'next', 'submit'].includes(act)) return;
+  if (state.result) return;
+
+  if (act === 'goto') return gotoQuestion(Number(btn.dataset.i));
+  if (act === 'prev') return gotoQuestion(state.examIndex - 1);
+  if (act === 'next') return gotoQuestion(state.examIndex + 1);
+  if (act === 'submit') return submitExam();
 }
 
 /* ------------------------------ 后台评卷 ------------------------------ */
@@ -1589,6 +1762,31 @@ function onAnswerInput(e) {
   } else {
     state.answers[qid] = e.target.value;
   }
+
+  refreshQNav(); // 答题卡同步「已答」
+
+  // 单选 / 判断题选完后自动进入下一题（可在答题页关掉）
+  // 注意：radio 会同时触发 input 与 change，这里必须去重，否则会连跳两题
+  const choiceDone = (q.type === 'single' || q.type === 'judge') && e.target.type === 'radio' && e.target.checked;
+  if (choiceDone && state.autoNext && state.examIndex < state.paper.questions.length - 1) {
+    const from = state.examIndex;
+    clearTimeout(autoNextTimer);
+    autoNextTimer = setTimeout(() => {
+      autoNextTimer = null;
+      // 期间若用户已手动切题，就不要再跳
+      if (state.examIndex === from && !state.result) gotoQuestion(from + 1);
+    }, 260);
+  }
+}
+
+/** 只刷新答题卡（已答状态 / 已答计数），不重绘题目，避免打断作答 */
+function refreshQNav() {
+  if (!state.paper) return;
+  const sig = state.paper.questions.map((q) => (isAnswered(q) ? '1' : '0')).join('');
+  if (sig === qNavSig) return; // 已答状态没变就不用重绘
+  qNavSig = sig;
+  const wrap = $('.q-nav-wrap');
+  if (wrap) wrap.outerHTML = qNavHTML();
 }
 
 /** 提交答卷：服务端立即入队返回任务 id，评卷在后台串行执行，页面不再等待 */
@@ -1597,11 +1795,7 @@ async function submitExam() {
   if (!p) return;
   if (state.grading && state.grading.paperId === p.id) return toast('该答卷已在后台评卷，请稍候', true);
 
-  const unanswered = p.questions.filter((q) => {
-    const a = state.answers[q.id];
-    if (a == null || a === '') return true;
-    return Array.isArray(a) && a.every((x) => String(x).trim() === '');
-  });
+  const unanswered = p.questions.filter((q) => !isAnswered(q));
   if (unanswered.length && !confirm(`还有 ${unanswered.length} 道题未作答，确定提交吗？`)) return;
 
   try {
@@ -1747,6 +1941,7 @@ function renderResult() {
     state.result = null;
     state.viewingHistory = false;
     state.answers = {};
+    state.examIndex = 0;
     renderExam();
   });
   const back = $('#btnBackHistory');
@@ -1964,6 +2159,250 @@ function onHistoryClick(e) {
   const btn = e.target.closest('button[data-act="view"]');
   if (!btn) return;
   openSubmission(btn.dataset.sub, btn.dataset.paper);
+}
+
+/* ------------------------------ 复习 / 闪卡（间隔重复） ------------------------------ */
+
+const todayStr = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+
+async function loadReviews() {
+  const q = state.reviewSubject ? `?subject=${encodeURIComponent(state.reviewSubject)}` : '';
+  try {
+    const { cards, stats } = await api('/reviews' + q);
+    state.reviewCards = cards;
+    state.reviewStats = stats;
+    state.reviewById = new Map(cards.map((c) => [c.id, c]));
+    $('#reviewBadge').textContent = stats.due ? String(stats.due) : '';
+    if (state.view === 'review') renderReviews();
+  } catch (e) {
+    /* 忽略 */
+  }
+}
+
+/** 今天该复习的卡片（逾期优先，其次按到期日） */
+function reviewDueCards() {
+  const today = todayStr();
+  return state.reviewCards
+    .filter((c) => String(c.due || today) <= today)
+    .sort((a, b) => String(a.due || '').localeCompare(String(b.due || '')) || (b.lapses || 0) - (a.lapses || 0));
+}
+
+function startReviewSession(cards) {
+  const list = (cards || []).slice(0, 30);
+  if (!list.length) return toast('今天没有需要复习的卡片', true);
+  state.reviewSession = { queue: list.map((c) => c.id), pos: 0, done: 0, known: 0, fuzzy: 0, forgot: 0 };
+  state.reviewRevealed = false;
+  renderReviews();
+}
+
+function renderReviewStats() {
+  const st = state.reviewStats;
+  const el = $('#reviewStats');
+  if (!st) {
+    el.innerHTML = '';
+    return;
+  }
+  el.innerHTML = `
+    <span class="rs"><b>${st.due}</b> 今日待复习</span>
+    <span class="rs"><b>${st.total}</b> 卡片总数</span>
+    <span class="rs"><b>${st.learned}</b> 已进入长间隔</span>
+    <span class="rs"><b>${st.reviews}</b> 累计复习次数</span>
+    <span class="rs"><b>${st.lapses}</b> 累计遗忘</span>`;
+}
+
+function renderReviewNav() {
+  const entries = ((state.reviewStats && state.reviewStats.bySubject) || []).map((b) => ({
+    name: b.subject,
+    count: b.count,
+  }));
+  renderSubjectNav($('#reviewSubjectNav'), entries, state.reviewSubject, (name) => {
+    state.reviewSubject = name;
+    state.reviewSession = null;
+    state.reviewRevealed = false;
+    loadReviews();
+  });
+}
+
+function renderReviews() {
+  renderReviewStats();
+  renderReviewNav();
+
+  const el = $('#reviewPane');
+  if (state.reviewMode === 'all') {
+    el.innerHTML = allCardsHTML();
+    return;
+  }
+
+  const s = state.reviewSession;
+  if (!s || !s.queue.length) {
+    const due = reviewDueCards();
+    el.innerHTML = due.length
+      ? `<div class="review-start">
+           <p class="hint">今天有 <b>${due.length}</b> 张卡片需要复习（共 ${state.reviewCards.length} 张卡片）。</p>
+           <button class="primary" data-act="start">开始复习</button>
+         </div>`
+      : `<div class="empty">${
+          state.reviewCards.length
+            ? '今天的复习已完成，休息一下。'
+            : '还没有复习卡片：点上方「同步错题本」，把错题变成闪卡。'
+        }</div>`;
+    return;
+  }
+
+  if (s.pos >= s.queue.length) {
+    el.innerHTML = `<div class="empty">本轮复习完成：复习 ${s.done} 次 · 记得 ${s.known} · 模糊 ${s.fuzzy} · 忘了 ${s.forgot}
+      <div class="flash-actions"><button class="ghost" data-act="restart">再复习一遍</button></div></div>`;
+    return;
+  }
+
+  const card = state.reviewById.get(s.queue[s.pos]);
+  if (!card) {
+    s.pos += 1;
+    renderReviews();
+    return;
+  }
+  el.innerHTML = flashCardHTML(card, s);
+}
+
+function flashCardHTML(card, s) {
+  const d = card.detail || {};
+  return `
+    <div class="flash-card">
+      <div class="flash-progress">第 ${s.pos + 1} / ${s.queue.length} 张 · 本轮 记得 ${s.known} · 模糊 ${
+    s.fuzzy
+  } · 忘了 ${s.forgot}</div>
+      <div class="q-head">
+        <span class="q-type">${TYPE_LABELS[card.type] || card.type || '卡片'}</span>
+        ${card.knowledge ? `<span class="tag">${esc(card.knowledge)}</span>` : ''}
+        ${card.paperTitle ? `<span class="q-points">${esc(card.paperTitle)}</span>` : ''}
+        <span class="q-points">间隔 ${card.interval || 0} 天 · 已复习 ${card.reviews || 0} 次</span>
+      </div>
+      <div class="q-stem">${esc(card.front)}</div>
+      ${d.material ? `<div class="material-box"><b>材料：</b>${esc(d.material)}</div>` : ''}
+      ${d.code ? codeHTML(d) : ''}
+      ${
+        state.reviewRevealed
+          ? `<div class="flash-answer">
+               <div class="analysis"><b>答案：</b>${esc(card.back)}</div>
+               ${d.analysis ? `<div class="analysis"><b>解析：</b>${esc(d.analysis)}</div>` : ''}
+               ${
+                 d.explanation && d.explanation.idea
+                   ? `<div class="comment"><b>讲解：</b>${esc(d.explanation.idea)}</div>`
+                   : ''
+               }
+             </div>
+             <div class="flash-actions">
+               <button class="ghost danger" data-act="grade" data-result="forgot">忘了</button>
+               <button class="ghost" data-act="grade" data-result="fuzzy">模糊</button>
+               <button class="primary" data-act="grade" data-result="known">记得</button>
+             </div>`
+          : `<div class="flash-actions"><button class="primary" data-act="reveal">显示答案（先自己回忆）</button></div>`
+      }
+    </div>`;
+}
+
+function allCardsHTML() {
+  if (!state.reviewCards.length) {
+    return '<div class="empty">还没有复习卡片：点上方「同步错题本」，把错题变成闪卡。</div>';
+  }
+  const today = todayStr();
+  return `<div class="list wide">${state.reviewCards
+    .map((c) => {
+      const due = String(c.due || '');
+      return `
+    <div class="review-row ${due && due <= today ? 'due' : ''}" data-id="${esc(c.id)}">
+      <div class="rr-main">
+        <div class="rr-title">${esc(String(c.front || '').split('\n')[0].slice(0, 90))}</div>
+        <div class="m">${TYPE_LABELS[c.type] || c.type || '卡片'}${c.knowledge ? ` · ${esc(c.knowledge)}` : ''} · ${esc(
+        c.subject || '未分类'
+      )} · 到期 ${esc(due || '-')} · 间隔 ${c.interval || 0} 天 · 记得 ${c.streak || 0} 次 / 忘 ${c.lapses || 0} 次</div>
+      </div>
+      <div class="ops">
+        <button class="ghost small" data-act="review-one">复习</button>
+        <button class="ghost small danger" data-act="del-card">删除</button>
+      </div>
+    </div>`;
+    })
+    .join('')}</div>`;
+}
+
+async function onReviewAction(e) {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+
+  const act = btn.dataset.act;
+  const row = btn.closest('.review-row');
+  const s = state.reviewSession;
+  const id = row ? row.dataset.id : s && s.queue[s.pos];
+
+  if (act === 'start' || act === 'restart') return startReviewSession(reviewDueCards());
+
+  if (act === 'reveal') {
+    state.reviewRevealed = true;
+    renderReviews();
+    return;
+  }
+
+  if (act === 'review-one') {
+    const card = state.reviewCards.find((c) => c.id === id);
+    if (card) startReviewSession([card]);
+    return;
+  }
+
+  if (act === 'del-card') {
+    if (!confirm('删除这张复习卡片？错题本不受影响。')) return;
+    try {
+      await api(`/reviews/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      state.reviewSession = null;
+      await loadReviews();
+      toast('卡片已删除');
+    } catch (err) {
+      toast(err.message, true);
+    }
+    return;
+  }
+
+  if (act !== 'grade') return;
+
+  const card = id ? state.reviewById.get(id) : null;
+  if (!s || !card) return;
+
+  const result = btn.dataset.result;
+  try {
+    const { card: updated } = await api(`/reviews/${encodeURIComponent(id)}/answer`, {
+      method: 'POST',
+      body: JSON.stringify({ result }),
+    });
+    Object.assign(card, updated);
+    s[result] = (s[result] || 0) + 1;
+    s.done += 1;
+    if (result === 'forgot') s.queue.push(id); // 忘了：今天再现一次
+    s.pos += 1;
+    state.reviewRevealed = false;
+    renderReviews();
+    loadReviews(); // 后台刷新统计与角标
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+async function syncReviews() {
+  const subject = state.reviewSubject;
+  busy('正在把错题同步成闪卡…');
+  try {
+    const r = await api('/reviews/sync', { method: 'POST', body: JSON.stringify({ subject }) });
+    state.reviewSession = null;
+    state.reviewRevealed = false;
+    await loadReviews();
+    toast(`同步完成：新增 ${r.added} 张${r.updated ? ` · 更新 ${r.updated} 张` : ''}，共 ${r.total} 张`);
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    idle();
+  }
 }
 
 /* ------------------------------ 错题本 ------------------------------ */

@@ -293,6 +293,26 @@ button { font-family: inherit; }
 .q-points { color: var(--muted); font-size: 12px; }
 .q-stem { white-space: pre-wrap; margin-bottom: 10px; }
 
+/* 单题作答：答题卡 + 底部导航（一屏一题，不用整卷下滑） */
+.exam-tools { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.exam-tools .check-line { font-size: 12.5px; color: var(--muted); }
+.q-nav-wrap { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 4px 0 14px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+.q-nav { display: flex; gap: 6px; flex-wrap: wrap; flex: 1; min-width: 0; }
+.q-dot { width: 30px; height: 30px; border-radius: 8px; border: 1px solid var(--line); background: #fff; font-size: 12.5px; color: var(--muted); cursor: pointer; transition: .12s; }
+.q-dot:hover { border-color: #c7d2fe; }
+.q-dot.done { background: var(--primary-soft); border-color: var(--primary-soft); color: var(--primary); font-weight: 600; }
+.q-dot.cur { border-color: var(--primary); color: var(--primary); box-shadow: 0 0 0 2px var(--primary-soft); font-weight: 600; }
+.q-nav-meta { font-size: 12.5px; color: var(--muted); white-space: nowrap; }
+.single-q .q-block { border-bottom: 0; padding: 4px 0; }
+.exam-footer {
+  position: sticky; bottom: 0; z-index: 3;
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  margin-top: 16px; padding: 12px 0 14px;
+  border-top: 1px solid var(--line);
+  background: #fff;
+}
+.exam-footer .hint { flex: 1; text-align: center; }
+
 /* ---------- 编程题：代码展示与代码作答 ---------- */
 .code-wrap { margin: 8px 0 10px; }
 .code-label { font-size: 12.5px; color: var(--muted); margin-bottom: 4px; }
@@ -412,6 +432,22 @@ button.danger { color: var(--danger); border-color: #fecaca; }
 .mistake-card.mastered { opacity: .72; }
 .mistake-head { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
 .mistake-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+
+/* 复习 / 闪卡（间隔重复） */
+.review-stats { display: flex; gap: 18px; flex-wrap: wrap; margin: 12px 0 14px; font-size: 13px; color: var(--muted); }
+.review-stats .rs b { font-size: 17px; color: var(--primary); margin-right: 3px; }
+.review-start { text-align: center; padding: 26px 10px; }
+.review-start .hint { margin-bottom: 14px; }
+.flash-card { border: 1px solid var(--line); border-radius: 12px; padding: 16px; background: #fff; }
+.flash-progress { font-size: 12.5px; color: var(--muted); margin-bottom: 10px; }
+.flash-answer { margin-top: 12px; }
+.flash-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; justify-content: center; }
+.review-row { display: flex; align-items: flex-start; gap: 12px; border: 1px solid var(--line); border-radius: 11px; padding: 12px 14px; background: #fff; }
+.review-row.due { border-color: #c7d2fe; background: #fbfcff; }
+.review-row .rr-main { flex: 1; min-width: 0; }
+.review-row .rr-title { font-weight: 600; font-size: 14px; margin-bottom: 4px; }
+.review-row .m { font-size: 12px; color: var(--muted); }
+.review-row .ops { display: flex; gap: 6px; flex-shrink: 0; }
 
 .explain { background: #f8fafc; border: 1px solid var(--line); border-radius: 12px; padding: 14px; margin-top: 12px; }
 .explain h4 { margin: 12px 0 4px; font-size: 14px; color: var(--primary); }

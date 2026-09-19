@@ -11,6 +11,7 @@ const submissions = db.collection('submissions');
 const mistakes = db.collection('mistakes');
 const subjects = db.collection('subjects');
 const documents = db.collection('documents');
+const reviews = db.collection('reviews');
 const settings = db.collection('settings');
 
 export async function initStore() {
@@ -33,6 +34,7 @@ export const getSubmissions = () => submissions.all();
 export const getMistakes = () => mistakes.all();
 export const getSubjects = () => subjects.all();
 export const getDocuments = () => documents.all();
+export const getReviews = () => reviews.all();
 
 /* ------------------------------ 设置 ------------------------------ */
 
@@ -220,6 +222,23 @@ export function documentSummary(doc) {
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
   };
+}
+
+/* ------------------------------ 复习卡片（闪卡 + 间隔排期） ------------------------------ */
+
+export const findReview = (id) => reviews.byId(id);
+export const findReviewByMistake = (mistakeId) => reviews.find((c) => c.mistakeId === mistakeId);
+
+export function addReview(card) {
+  return reviews.insert(card);
+}
+
+export function removeReview(id) {
+  return reviews.remove(id);
+}
+
+export function upsertReview(id, patch) {
+  return reviews.update(id, patch);
 }
 
 /** 整体落盘（保持旧调用方式可用） */

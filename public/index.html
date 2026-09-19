@@ -20,6 +20,7 @@
         <button class="tab" data-view="exam">答题评卷</button>
         <button class="tab" data-view="history">做题历史</button>
         <button class="tab" data-view="mistakes">错题本<em id="mistakeBadge"></em></button>
+        <button class="tab" data-view="review">复习<em id="reviewBadge"></em></button>
       </nav>
       <span id="queueTag" class="queue-tag hidden" title="评卷在服务端后台排队执行，同一时刻只评一份"></span>
       <div class="topbar-right">
@@ -298,6 +299,39 @@
                 </div>
               </div>
               <div id="mistakeList" class="list wide"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 复习 / 闪卡（间隔重复） -->
+      <section class="view hidden" id="view-review">
+        <div class="layout">
+          <button class="side-toggle" data-side="review" title="收起侧边栏">«</button>
+          <aside class="card side">
+            <div class="side-head">
+              <h2>科目</h2>
+              <button id="btnRefreshReviews" class="ghost small">刷新</button>
+            </div>
+            <div id="reviewSubjectNav" class="subject-nav"></div>
+          </aside>
+          <div class="main-col">
+            <div class="card">
+              <div class="side-head">
+                <h2>复习 / 闪卡</h2>
+                <div class="filters">
+                  <button class="chip active" data-rmode="today">今日待复习</button>
+                  <button class="chip" data-rmode="all">全部卡片</button>
+                </div>
+              </div>
+              <div class="actions">
+                <button id="btnSyncReviews" class="primary small">同步错题本</button>
+                <span class="hint"
+                  >把错题本里的题变成闪卡：先自己回忆，再点「显示答案」对要点，按「忘了 / 模糊 / 记得」评分，系统自动安排下次复习（当天重来 → 1 天 → 3 天 → 逐次递增）。</span
+                >
+              </div>
+              <div id="reviewStats" class="review-stats"></div>
+              <div id="reviewPane"></div>
             </div>
           </div>
         </div>

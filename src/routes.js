@@ -1612,6 +1612,205 @@ router.delete(
   })
 );
 
+/* ------------------------------ 复习 / 闪卡（间隔重复） ------------------------------ */
+
+const REVIEW_RESULTS = ['forgot', 'fuzzy', 'known'];
+/** 单张卡片的最大复习间隔（天） */
+const REVIEW_MAX_INTERVAL = 180;
+
+/** 本地时区的日期字符串 YYYY-MM-DD */
+function dayStr(date = new Date()) {
+  const d = date instanceof Date ? date : new Date(date);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function addDays(day, n) {
+  const d = new Date(`${day}T00:00:00`);
+  d.setDate(d.getDate() + Number(n || 0));
+  return dayStr(d);
+}
+
+/** 简化版 SM-2：三档评分（忘了 / 模糊 / 记得）→ 下次到期日与间隔 */
+function scheduleReview(card, result) {
+  const today = dayStr();
+  let { ease = 2.5, interval = 0, streak = 0, lapses = 0, reviews = 0 } = card;
+
+  if (result === 'forgot') {
+    ease = Math.max(1.3, Number((ease - 0.2).toFixed(2)));
+    interval = 0; // 当天再来一遍
+    streak = 0;
+    lapses += 1;
+  } else if (result === 'fuzzy') {
+    ease = Math.max(1.3, Number((ease - 0.05).toFixed(2)));
+    interval = interval < 1 ? 1 : Math.min(REVIEW_MAX_INTERVAL, Math.max(1, Math.round(interval * 1.2)));
+    streak += 1;
+  } else {
+    streak += 1;
+    if (interval < 1) interval = 1;
+    else if (interval < 3) interval = 3;
+    else interval = Math.min(REVIEW_MAX_INTERVAL, Math.round(interval * ease));
+  }
+
+  return {
+    ease,
+    interval,
+    streak,
+    lapses,
+    reviews: reviews + 1,
+    due: addDays(today, interval),
+    lastResult: result,
+    lastReviewedAt: new Date().toISOString(),
+  };
+}
+
+/** 由错题生成闪卡正面（题干 + 选项）与背面（答案要点 + 记忆点） */
+function cardFacesFrom(mistake) {
+  const q = mistake.question || {};
+  const knowledge = String(mistake.knowledge || q.knowledge || '').trim();
+  const options = (q.options || []).map((o, i) => `${String.fromCharCode(65 + i)}. ${o}`);
+  const front = [String(q.stem || '').trim() || knowledge, ...options].filter(Boolean).join('\n');
+  const remember = mistake.explanation?.remember ? `\n必须记住：${mistake.explanation.remember}` : '';
+  return {
+    front,
+    back: `参考答案：${formatAnswer(q)}${remember}`,
+    knowledge,
+    type: q.type || '',
+    detail: {
+      options: q.options || [],
+      material: q.material || '',
+      language: q.language || '',
+      code: q.code || '',
+      points: q.points || 0,
+      analysis: q.analysis || '',
+      correctAnswer: q.answer,
+      explanation: mistake.explanation || null,
+    },
+  };
+}
+
+/**
+ * 复习卡片列表：?due=1 只返回今天该复习的（含逾期），?subject= 按科目过滤。
+ * 同时给出统计，供前端显示「今日待复习 N 张」与科目分布。
+ */
+router.get(
+  '/reviews',
+  wrap((req, res) => {
+    const subject = String(req.query?.subject || '').trim();
+    const dueOnly = ['1', 'true', 'yes'].includes(String(req.query?.due || '').toLowerCase());
+    const today = dayStr();
+
+    const all = store
+      .getReviews()
+      .filter((c) => !subject || String(c.subject || '').trim() === subject);
+
+    const stats = {
+      total: all.length,
+      due: all.filter((c) => String(c.due || today) <= today).length,
+      learned: all.filter((c) => (c.streak || 0) >= 2).length,
+      lapses: all.reduce((sum, c) => sum + (c.lapses || 0), 0),
+      reviews: all.reduce((sum, c) => sum + (c.reviews || 0), 0),
+      bySubject: [
+        ...all
+          .reduce((map, c) => {
+            const name = String(c.subject || '').trim() || '未分类';
+            const item = map.get(name) || { subject: name, count: 0, due: 0 };
+            item.count += 1;
+            if (String(c.due || today) <= today) item.due += 1;
+            map.set(name, item);
+            return map;
+          }, new Map())
+          .values(),
+      ].sort((a, b) => b.due - a.due || b.count - a.count),
+    };
+
+    const cards = (dueOnly ? all.filter((c) => String(c.due || today) <= today) : all).sort((a, b) =>
+      dueOnly
+        ? String(a.due || '').localeCompare(String(b.due || '')) || (b.lapses || 0) - (a.lapses || 0)
+        : String(a.due || '').localeCompare(String(b.due || '')) || String(b.createdAt || '').localeCompare(String(a.createdAt || ''))
+    );
+
+    res.json({ cards: cards.slice(0, 500), stats });
+  })
+);
+
+/** 把错题本里的错题同步成闪卡（同一道错题只保留一张卡片，排期不因同步重置） */
+router.post(
+  '/reviews/sync',
+  wrap((req, res) => {
+    const subject = String(req.body?.subject || '').trim();
+    const today = dayStr();
+    const now = new Date().toISOString();
+    const list = store.getMistakes().filter((m) => !subject || String(m.subject || '').trim() === subject);
+
+    let added = 0;
+    let updated = 0;
+    for (const m of list) {
+      const faces = cardFacesFrom(m);
+      if (!faces.front) continue;
+
+      const exist = store.findReviewByMistake(m.id);
+      if (exist) {
+        if (exist.front !== faces.front || exist.back !== faces.back) {
+          store.upsertReview(exist.id, { ...faces, subject: String(m.subject || '').trim(), updatedAt: now });
+          updated += 1;
+        }
+        continue;
+      }
+
+      store.addReview({
+        id: store.uid('rev'),
+        source: 'mistake',
+        mistakeId: m.id,
+        paperId: m.paperId || '',
+        paperTitle: m.paperTitle || '',
+        questionId: m.questionId || '',
+        subject: String(m.subject || '').trim(),
+        ...faces,
+        ease: 2.5,
+        interval: 0,
+        streak: 0,
+        lapses: 0,
+        reviews: 0,
+        due: today,
+        lastResult: '',
+        lastReviewedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+      added += 1;
+    }
+
+    store.save();
+    console.log(`[review] 同步错题 → 新增 ${added} 张 · 更新 ${updated} 张 · 共 ${store.getReviews().length} 张`);
+    res.json({ added, updated, total: store.getReviews().length });
+  })
+);
+
+/** 提交一张卡片的复习结果（forgot / fuzzy / known），返回更新后的排期 */
+router.post(
+  '/reviews/:id/answer',
+  wrap((req, res) => {
+    const card = store.findReview(req.params.id);
+    if (!card) throw httpError(404, '复习卡片不存在');
+
+    const result = String(req.body?.result || '').trim();
+    if (!REVIEW_RESULTS.includes(result)) throw httpError(400, '评分只能是 forgot / fuzzy / known');
+
+    store.upsertReview(card.id, { ...scheduleReview(card, result), updatedAt: new Date().toISOString() });
+    store.save();
+    res.json({ card: { ...card } });
+  })
+);
+
+router.delete(
+  '/reviews/:id',
+  wrap((req, res) => {
+    if (!store.findReview(req.params.id)) throw httpError(404, '复习卡片不存在');
+    store.removeReview(req.params.id);
+    res.json({ ok: true });
+  })
+);
+
 /* ------------------------------ 工具函数 ------------------------------ */
 
 /** 拼进 prompt 的历年真题原文上限（字符），超出截断 */
