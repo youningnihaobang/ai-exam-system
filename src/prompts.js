@@ -477,3 +477,134 @@ ${question.code ? `- 原代码：\n${String(question.code).slice(0, 1500)}` : ''
 
   return { system: PROPOSER_SYSTEM, user, temperature: 0.6 };
 }
+
+/* ------------------------------ 记忆效率相关 prompt ------------------------------ */
+
+/** 简要题面（多个 prompt 复用） */
+function questionBrief(question, subject) {
+  const q = question || {};
+  return `- 科目：${subject || '未标注'}
+- 题型：${TYPE_LABELS[q.type] || q.type || '未标注'}
+${q.material ? `- 材料：${String(q.material).slice(0, 300)}` : ''}
+- 题干：${String(q.stem || '').slice(0, 400)}
+- 参考答案：${JSON.stringify(q.answer ?? '')}${q.analysis ? `\n- 解析：${String(q.analysis).slice(0, 400)}` : ''}`;
+}
+
+/** 挖空回忆：把答案拆成「提示词 → 要点」若干组，用于主动回忆 */
+export function buildClozePrompt({ subject, question }) {
+  const user = `请把下面这道题的答案拆成 2~5 个记忆要点，用于「挖空回忆」式复习（只看提示词，自己补全要点）。
+${questionBrief(question, subject)}
+
+输出 JSON：
+{
+  "points": [
+    { "hint": "提示词（不超过 8 字，能引导回忆但不要泄露答案）", "answer": "该要点必须写出的内容（不超过 40 字）" }
+  ]
+}
+
+要求：
+1. 要点覆盖得分关键，按重要性排序；数量不超过 5 个。
+2. 提示词之间要有区分度，不能互相提示同一内容。
+3. 不要复述题干，不要额外解释，只输出 JSON。`;
+  return { system: PROPOSER_SYSTEM, user, temperature: 0.3 };
+}
+
+/** AI 助记：口诀 / 首字缩写 / 类比 */
+export function buildMnemonicPrompt({ subject, question }) {
+  const user = `请为下面这道题设计助记方案，帮助快速记住答案要点。
+${questionBrief(question, subject)}
+
+输出 JSON：
+{
+  "mnemonic": "一句话助记（口诀 / 顺口溜 / 首字缩写，尽量押韵、好念、好记）",
+  "association": "生活化类比或联想场景，用一句话说明怎么把要点串起来",
+  "keywords": ["必须记住的关键词1", "关键词2"]
+}
+
+要求：
+1. 助记必须真的能对应答案要点，不要空洞口号。
+2. keywords 2~5 个，每个不超过 8 字。
+3. 不要复述题干与解析，只输出 JSON。`;
+  return { system: PROPOSER_SYSTEM, user, temperature: 0.6 };
+}
+
+/** 费曼复述评分：让用户用自己的话讲一遍，按要点给分并指出遗漏 */
+export function buildFeynmanPrompt({ subject, question, text }) {
+  const user = `学生正在用自己的话复述下面这道题的答案（费曼学习法）。请按参考答案要点评分。
+${questionBrief(question, subject)}
+- 学生的复述：${String(text || '').slice(0, 1500)}
+
+输出 JSON：
+{
+  "score": 0 到 100 的整数（覆盖参考答案要点的程度；表述不同但意思一致算对）,
+  "hit": ["复述中答对的要点"],
+  "missing": ["漏掉或说错的要点"],
+  "comment": "一句话点评 + 补漏建议（60 字以内）"
+}
+
+要求：宁可严格也不要虚高；完全没有覆盖要点时 score 给 0~20。只输出 JSON。`;
+  return { system: '你是严格的阅卷老师，只输出合法 JSON。', user, temperature: 0.2 };
+}
+
+/** 复习作答的快速判定（先判对错，不展开逐点评分） */
+export function buildReviewCheckPrompt({ subject, question, studentAnswer }) {
+  const user = `请判断学生的作答是否正确（用于复习卡片的客观校准）。
+${questionBrief(question, subject)}
+- 学生作答：${studentAnswer === '' || studentAnswer == null ? '（未作答）' : JSON.stringify(studentAnswer)}
+
+输出 JSON：
+{
+  "correct": true 或 false,
+  "score": 得分（数字，满分按题目分值，未给分值就按 0~1 的比例）,
+  "comment": "一句话说明漏了什么 / 错在哪（40 字以内）"
+}
+
+要求：只判「是否达到得分要点」，不要求与参考答案逐字一致；同义表述算对。只输出 JSON。`;
+  return { system: '你是严格的阅卷老师，只输出合法 JSON。', user, temperature: 0.2 };
+}
+
+/** 易混对比卡：从知识点清单里挑最容易混淆的组合，生成专项区分卡 */
+export function buildConfusionPrompt({ subject, points }) {
+  const list = (points || [])
+    .slice(0, 40)
+    .map((p, i) => `${i + 1}. ${p}`)
+    .join('\n');
+
+  const user = `以下是「${subject || '本次复习范围'}」的知识点清单，请找出其中最容易被混淆的 3~5 组，生成「易混对比卡」用于专项区分训练。
+
+【知识点清单】
+${list}
+
+输出 JSON：
+{
+  "pairs": [
+    {
+      "a": "概念 A（必须是清单里的知识点）",
+      "b": "概念 B（必须是清单里的知识点）",
+      "front": "一句话设问，要求区分两者（如：A 与 B 的区别是什么？）",
+      "back": "分条写出两者在 2~4 个维度上的区别，并各给一个典型例子",
+      "tip": "一句话记忆提示，说明怎么一眼区分"
+    }
+  ]
+}
+
+要求：
+1. 只挑真的容易混的（名称相近、含义相邻、常被当成同一件事），不要凑数；不足 3 组就有几组写几组。
+2. a、b 必须来自上面的清单，不得新造知识点。
+3. 只输出 JSON。`;
+  return { system: PROPOSER_SYSTEM, user, temperature: 0.5 };
+}
+
+/** 错因归纳：把学生自述的错因归类，并给出针对性建议 */
+export function buildWhyPrompt({ subject, question, text }) {
+  const user = `学生在复习时记录了自己出错的原因，请归类并给出一条针对性建议。
+${questionBrief(question, subject)}
+- 学生自述：${String(text || '').slice(0, 500)}
+
+错因类型只能取以下之一，必须原样使用（不要改写、不要新增类型）：
+概念混淆 / 记忆不牢 / 审题遗漏 / 计算或推导失误 / 方法不熟 / 表达不到位 / 粗心
+
+只输出一行合法 JSON，不要解释、不要 Markdown 代码块，字符串一律使用英文双引号：
+{"type":"上面的类型之一","advice":"针对这个错因的一条具体复习建议（40 字以内）"}`;
+  return { system: ANALYZER_SYSTEM, user, temperature: 0.2 };
+}

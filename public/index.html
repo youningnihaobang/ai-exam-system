@@ -322,15 +322,18 @@
                 <div class="filters">
                   <button class="chip active" data-rmode="today">今日待复习</button>
                   <button class="chip" data-rmode="all">全部卡片</button>
+                  <button class="chip" data-rmode="leech">顽固卡</button>
                 </div>
               </div>
               <div class="actions">
                 <button id="btnSyncReviews" class="primary small">同步错题本</button>
+                <button id="btnConfusion" class="ghost small">生成易混对比卡</button>
                 <span class="hint"
-                  >把错题本里的题变成闪卡：先自己回忆，再点「显示答案」对要点，按「忘了 / 模糊 / 记得」评分，系统自动安排下次复习（当天重来 → 1 天 → 3 天 → 逐次递增）。</span
+                  >先自己回忆（选项默认隐藏）→ 「我自己答一遍」拿到客观判定，或「显示答案」后按忘了 / 模糊 / 记得自评；还可挖空回忆、AI 助记、费曼复述、记录错因。排期按 FSRS 近似算法推进。</span
                 >
               </div>
               <div id="reviewStats" class="review-stats"></div>
+              <div id="reviewBoard"></div>
               <div id="reviewPane"></div>
             </div>
           </div>

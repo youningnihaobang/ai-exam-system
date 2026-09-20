@@ -3,12 +3,18 @@ import multer from 'multer';
 import { aiProgress, aiStatus, chatJSON, currentModel, listModels, setActiveModel } from './ai.js';
 import {
   buildAnalyzePrompt,
+  buildClozePrompt,
+  buildConfusionPrompt,
   buildExplainPrompt,
+  buildFeynmanPrompt,
   buildGeneratePrompt,
   buildGradePrompt,
+  buildMnemonicPrompt,
   buildOutlinePrompt,
   buildRealExamPrompt,
+  buildReviewCheckPrompt,
   buildVariantPrompt,
+  buildWhyPrompt,
   TYPE_LABELS,
 } from './prompts.js';
 import { formatAnswer, isBlankAnswer, judgeObjective, normalizeQuestions } from './normalize.js';
@@ -1418,9 +1424,22 @@ router.get(
     let list = store.getMistakes();
     if (req.query.mastered === 'true') list = list.filter((m) => m.mastered);
     if (req.query.mastered === 'false') list = list.filter((m) => !m.mastered);
+
+    // 关联复习卡片：带上掌握度与下次复习时间，便于错题本直接展示
+    const cardOf = new Map(store.getReviews().filter((c) => c.mistakeId).map((c) => [c.mistakeId, c]));
+
     // 老错题没有顶层 knowledge，从题目里补出来，供前端按知识点分组
     res.json({
-      mistakes: list.map((m) => ({ ...m, knowledge: m.knowledge || m.question?.knowledge || '' })),
+      mistakes: list.map((m) => {
+        const card = cardOf.get(m.id);
+        return {
+          ...m,
+          knowledge: m.knowledge || m.question?.knowledge || '',
+          mastery: card ? (card.mastery == null ? masteryOf(card) : card.mastery) : null,
+          nextDue: card?.due || null,
+          leech: Boolean(card && (card.lapses || 0) >= LEECH_LAPSES),
+        };
+      }),
     });
   })
 );
@@ -1565,6 +1584,18 @@ async function gradeVariants({ mistakeId, answers }) {
       passed: allCorrect,
     };
     if (allCorrect) m.variants.passedOnce = true;
+
+    // 变式题结果接入复习排期：全对推进，未全对回到今天（并计入客观正确率）
+    const card = store.findReviewByMistake(m.id);
+    if (card) {
+      store.upsertReview(card.id, {
+        ...scheduleReview(card, allCorrect ? 'known' : 'forgot'),
+        objective: bumpObjective(card, allCorrect, 'variant'),
+        updatedAt: new Date().toISOString(),
+      });
+      console.log(`[review] 变式题联动 ${card.knowledge || card.id} → ${allCorrect ? '排期推进' : '今天重来'}`);
+    }
+
     store.save();
     return { mistake: m, passed: allCorrect };
 }
@@ -1586,6 +1617,68 @@ router.post(
     await job.promise;
     if (job.status === 'error') throw httpError(500, job.error || '批改失败');
     res.json(job.result);
+  })
+);
+
+/**
+ * 错题重做：先作答、不看解析（测试效应），
+ * 做对 → 标记已掌握并推进复习排期；做错 → 累计错误次数、排期回到今天。
+ */
+router.post(
+  '/mistakes/:id/retry',
+  wrap(async (req, res) => {
+    const m = store.findMistake(req.params.id);
+    if (!m) throw httpError(404, '错题不存在');
+
+    const q = m.question || {};
+    const answer = req.body?.answer;
+    let graded = judgeObjective(q, answer);
+    let byAI = false;
+    if (!graded) {
+      const { system, user, temperature } = buildReviewCheckPrompt({
+        subject: m.subject,
+        question: q,
+        studentAnswer: answer,
+      });
+      const data = await chatJSON({ system, user, temperature, maxTokens: 1024, label: '错题重做判定' });
+      graded = {
+        correct: Boolean(data?.correct),
+        score: Number(data?.score) || 0,
+        reason: String(data?.comment || '').trim(),
+      };
+      byAI = true;
+    }
+
+    const now = new Date().toISOString();
+    const card = store.findReviewByMistake(m.id);
+    if (card) {
+      store.upsertReview(card.id, {
+        ...scheduleReview(card, graded.correct ? 'known' : 'forgot'),
+        objective: bumpObjective(card, graded.correct, 'retry'),
+        updatedAt: now,
+      });
+    }
+
+    if (graded.correct) {
+      m.mastered = true;
+      m.masteredAt = now;
+      m.masteredByRetry = true;
+    } else {
+      m.mastered = false;
+      m.lastWrongAt = now;
+      m.wrongTimes = (m.wrongTimes || 1) + 1;
+    }
+    store.save();
+
+    console.log(`[retry] 错题重做 ${m.id} → ${graded.correct ? '正确（已掌握）' : '错误'}${byAI ? '（AI）' : '（本地）'}`);
+    res.json({
+      correct: graded.correct,
+      byAI,
+      comment: graded.reason || '',
+      correctAnswerText: formatAnswer(q),
+      mistake: m,
+      card: card ? { ...card } : null,
+    });
   })
 );
 
@@ -1630,37 +1723,107 @@ function addDays(day, n) {
   return dayStr(d);
 }
 
-/** 简化版 SM-2：三档评分（忘了 / 模糊 / 记得）→ 下次到期日与间隔 */
+/** 顽固卡阈值：遗忘次数达到这个值，建议换一种记忆方式 */
+const LEECH_LAPSES = 4;
+
+const clampNum = (n, min, max) => Math.min(max, Math.max(min, Number(n) || 0));
+
+/**
+ * 掌握度 0~100：连续记得 + 间隔长度 + 客观作答正确率，减去遗忘惩罚。
+ * 用于替代「已掌握 / 未掌握」的二元判断。
+ */
+function masteryOf(card) {
+  const streak = card.streak || 0;
+  const interval = card.interval || 0;
+  const lapses = card.lapses || 0;
+  const obj = card.objective || { checks: 0, correct: 0 };
+  const objRate = obj.checks ? obj.correct / obj.checks : null;
+
+  const base = Math.min(40, streak * 6);
+  const span = Math.min(30, (Math.log2(Math.max(1, interval)) / Math.log2(REVIEW_MAX_INTERVAL)) * 30);
+  const objective = objRate == null ? 12 : objRate * 30;
+  const penalty = Math.min(25, lapses * 4);
+
+  return Math.round(clampNum(base + span + objective - penalty, 0, 100));
+}
+
+/**
+ * FSRS 风格的排期（近似实现）：维护稳定度 stability（天）与难度 difficulty（1~10），
+ * 评分越高间隔增长越快，难度越高增长越慢；忘记则稳定度大幅回退并要求当天重来。
+ */
 function scheduleReview(card, result) {
   const today = dayStr();
-  let { ease = 2.5, interval = 0, streak = 0, lapses = 0, reviews = 0 } = card;
+  const prevInterval = Number(card.interval) || 0;
+  let S = Number(card.stability) || Math.max(0.6, prevInterval || 1.2);
+  let D = Number(card.difficulty) || clampNum(5 + (card.lapses || 0) * 0.6, 1, 10);
 
   if (result === 'forgot') {
-    ease = Math.max(1.3, Number((ease - 0.2).toFixed(2)));
-    interval = 0; // 当天再来一遍
-    streak = 0;
-    lapses += 1;
+    D = clampNum(D + 0.8, 1, 10);
+    S = Math.max(0.4, S * 0.28);
   } else if (result === 'fuzzy') {
-    ease = Math.max(1.3, Number((ease - 0.05).toFixed(2)));
-    interval = interval < 1 ? 1 : Math.min(REVIEW_MAX_INTERVAL, Math.max(1, Math.round(interval * 1.2)));
-    streak += 1;
+    D = clampNum(D + 0.15, 1, 10);
+    S = Math.max(1, S * (1 + 0.75 * (1 - D / 10)));
   } else {
-    streak += 1;
-    if (interval < 1) interval = 1;
-    else if (interval < 3) interval = 3;
-    else interval = Math.min(REVIEW_MAX_INTERVAL, Math.round(interval * ease));
+    D = clampNum(D - 0.25, 1, 10);
+    S = Math.max(1.2, S * (1 + 2.2 * (1 - D / 10)));
   }
+  S = Math.min(REVIEW_MAX_INTERVAL * 1.5, Number(S.toFixed(2)));
 
-  return {
-    ease,
+  let interval = result === 'forgot' ? 0 : Math.round(S);
+  if (result !== 'forgot') {
+    // 间隔至少比上次略长（遗忘卡除外），避免长期卡片反复出现
+    interval = Math.max(interval, Math.ceil(prevInterval * 1.05), 1);
+  }
+  interval = Math.min(REVIEW_MAX_INTERVAL, interval);
+
+  const next = {
+    stability: S,
+    difficulty: D,
     interval,
-    streak,
-    lapses,
-    reviews: reviews + 1,
+    streak: result === 'forgot' ? 0 : (card.streak || 0) + 1,
+    lapses: (card.lapses || 0) + (result === 'forgot' ? 1 : 0),
+    reviews: (card.reviews || 0) + 1,
     due: addDays(today, interval),
     lastResult: result,
     lastReviewedAt: new Date().toISOString(),
+    ease: Number((2.6 - (D - 5) * 0.15).toFixed(2)), // 兼容旧前端展示
   };
+  next.leech = next.lapses >= LEECH_LAPSES;
+  next.mastery = masteryOf({ ...card, ...next });
+  return next;
+}
+
+/** 记录一次「客观作答」结果（用于校准自评、统计正确率） */
+function bumpObjective(card, correct, mode = 'check') {
+  const obj = card.objective || { checks: 0, correct: 0 };
+  const byMode = { ...(card.objective?.byMode || {}) };
+  const item = byMode[mode] || { checks: 0, correct: 0 };
+  item.checks += 1;
+  if (correct) item.correct += 1;
+  byMode[mode] = item;
+  return { checks: obj.checks + 1, correct: obj.correct + (correct ? 1 : 0), byMode, lastAt: new Date().toISOString() };
+}
+
+/** 知识点交错：尽量不让相邻两张卡考同一知识点（避免「熟悉感」代替回忆） */
+function interleave(cards) {
+  const buckets = new Map();
+  for (const c of cards) {
+    const key = String(c.knowledge || '').trim() || '未标注知识点';
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(c);
+  }
+  const lists = [...buckets.entries()]
+    .map(([key, items]) => ({ key, items }))
+    .sort((a, b) => b.items.length - a.items.length);
+
+  const out = [];
+  let last = '';
+  while (lists.some((l) => l.items.length)) {
+    const pick = lists.find((l) => l.items.length && l.key !== last) || lists.find((l) => l.items.length);
+    out.push(pick.items.shift());
+    last = pick.key;
+  }
+  return out;
 }
 
 /** 由错题生成闪卡正面（题干 + 选项）与背面（答案要点 + 记忆点） */
@@ -1673,6 +1836,8 @@ function cardFacesFrom(mistake) {
   return {
     front,
     back: `参考答案：${formatAnswer(q)}${remember}`,
+    // 要点骨架：只给知识点 / 首句提示，逼自己展开回忆
+    skeleton: knowledge || String(q.stem || '').trim().slice(0, 14),
     knowledge,
     type: q.type || '',
     detail: {
@@ -1689,33 +1854,79 @@ function cardFacesFrom(mistake) {
 }
 
 /**
- * 复习卡片列表：?due=1 只返回今天该复习的（含逾期），?subject= 按科目过滤。
- * 同时给出统计，供前端显示「今日待复习 N 张」与科目分布。
+ * 复习卡片列表：
+ * - ?due=1 只返回今天该复习的（含逾期），队列按知识点交错打散；
+ * - ?subject= 按科目过滤，?filter=leech 只看顽固卡；
+ * - 同时给出统计：今日待复习、掌握度均值、未来 7 天到期预测、遗忘风险榜、错因分布。
  */
 router.get(
   '/reviews',
   wrap((req, res) => {
     const subject = String(req.query?.subject || '').trim();
-    const dueOnly = ['1', 'true', 'yes'].includes(String(req.query?.due || '').toLowerCase());
+    const filter = String(req.query?.filter || '').trim();
+    const dueOnly = filter === 'due' || ['1', 'true', 'yes'].includes(String(req.query?.due || '').toLowerCase());
     const today = dayStr();
 
-    const all = store
-      .getReviews()
-      .filter((c) => !subject || String(c.subject || '').trim() === subject);
+    const pool = store.getReviews().filter((c) => !subject || String(c.subject || '').trim() === subject);
+    const isDue = (c) => String(c.due || today) <= today;
+    const masteryVal = (c) => (c.mastery == null ? masteryOf(c) : c.mastery);
+
+    // 未来 7 天到期预测（第 0 天含逾期）
+    const forecast = [];
+    for (let i = 0; i < 7; i += 1) {
+      const day = addDays(today, i);
+      forecast.push({ date: day, count: pool.filter((c) => (i === 0 ? isDue(c) : String(c.due) === day)).length });
+    }
+
+    // 遗忘风险榜：按知识点聚合，逾期越多、遗忘越多、间隔越短越靠前
+    const riskMap = new Map();
+    for (const c of pool) {
+      const key = String(c.knowledge || '').trim() || '未标注知识点';
+      const item = riskMap.get(key) || { knowledge: key, count: 0, due: 0, lapses: 0, intervalSum: 0, masterySum: 0 };
+      item.count += 1;
+      item.due += isDue(c) ? 1 : 0;
+      item.lapses += c.lapses || 0;
+      item.intervalSum += c.interval || 0;
+      item.masterySum += masteryVal(c);
+      riskMap.set(key, item);
+    }
+    const risky = [...riskMap.values()]
+      .map((r) => {
+        const avgInterval = Number((r.intervalSum / r.count).toFixed(1));
+        return {
+          knowledge: r.knowledge,
+          count: r.count,
+          due: r.due,
+          lapses: r.lapses,
+          avgInterval,
+          avgMastery: Math.round(r.masterySum / r.count),
+          risk: Number((r.due * 2 + r.lapses * 1.5 + Math.max(0, 12 - avgInterval) * 0.4).toFixed(1)),
+        };
+      })
+      .sort((a, b) => b.risk - a.risk)
+      .slice(0, 8);
+
+    const errorMap = new Map();
+    for (const c of pool) for (const w of c.whyLogs || []) errorMap.set(w.type, (errorMap.get(w.type) || 0) + 1);
 
     const stats = {
-      total: all.length,
-      due: all.filter((c) => String(c.due || today) <= today).length,
-      learned: all.filter((c) => (c.streak || 0) >= 2).length,
-      lapses: all.reduce((sum, c) => sum + (c.lapses || 0), 0),
-      reviews: all.reduce((sum, c) => sum + (c.reviews || 0), 0),
+      total: pool.length,
+      due: pool.filter(isDue).length,
+      learned: pool.filter((c) => (c.interval || 0) >= 21 || masteryVal(c) >= 70).length,
+      lapses: pool.reduce((s, c) => s + (c.lapses || 0), 0),
+      reviews: pool.reduce((s, c) => s + (c.reviews || 0), 0),
+      leeches: pool.filter((c) => (c.lapses || 0) >= LEECH_LAPSES).length,
+      mastery: pool.length ? Math.round(pool.reduce((s, c) => s + masteryVal(c), 0) / pool.length) : 0,
+      forecast,
+      risky,
+      errorTypes: [...errorMap.entries()].map(([type, count]) => ({ type, count })).sort((a, b) => b.count - a.count),
       bySubject: [
-        ...all
+        ...pool
           .reduce((map, c) => {
             const name = String(c.subject || '').trim() || '未分类';
             const item = map.get(name) || { subject: name, count: 0, due: 0 };
             item.count += 1;
-            if (String(c.due || today) <= today) item.due += 1;
+            if (isDue(c)) item.due += 1;
             map.set(name, item);
             return map;
           }, new Map())
@@ -1723,13 +1934,18 @@ router.get(
       ].sort((a, b) => b.due - a.due || b.count - a.count),
     };
 
-    const cards = (dueOnly ? all.filter((c) => String(c.due || today) <= today) : all).sort((a, b) =>
-      dueOnly
-        ? String(a.due || '').localeCompare(String(b.due || '')) || (b.lapses || 0) - (a.lapses || 0)
-        : String(a.due || '').localeCompare(String(b.due || '')) || String(b.createdAt || '').localeCompare(String(a.createdAt || ''))
-    );
+    let cards = pool;
+    if (filter === 'leech') cards = cards.filter((c) => (c.lapses || 0) >= LEECH_LAPSES);
+    else if (dueOnly) cards = cards.filter(isDue);
 
-    res.json({ cards: cards.slice(0, 500), stats });
+    cards = [...cards].sort((a, b) =>
+      String(a.due || '').localeCompare(String(b.due || '')) ||
+      (filter === 'leech' ? (b.lapses || 0) - (a.lapses || 0) : String(b.createdAt || '').localeCompare(String(a.createdAt || '')))
+    );
+    // 到期复习队列：按知识点交错，避免连着出同一考点
+    if (dueOnly) cards = interleave(cards);
+
+    res.json({ cards: cards.slice(0, 500).map((c) => ({ ...c, mastery: masteryVal(c) })), stats });
   })
 );
 
@@ -1766,11 +1982,22 @@ router.post(
         questionId: m.questionId || '',
         subject: String(m.subject || '').trim(),
         ...faces,
+        // 排期状态（FSRS 风格）
+        stability: 1.2,
+        difficulty: 5,
         ease: 2.5,
         interval: 0,
         streak: 0,
         lapses: 0,
         reviews: 0,
+        mastery: 0,
+        leech: false,
+        mode: 'basic',
+        objective: { checks: 0, correct: 0, byMode: {} },
+        whyLogs: [],
+        cloze: null,
+        mnemonic: null,
+        feynman: null,
         due: today,
         lastResult: '',
         lastReviewedAt: null,
@@ -1799,6 +2026,306 @@ router.post(
     store.upsertReview(card.id, { ...scheduleReview(card, result), updatedAt: new Date().toISOString() });
     store.save();
     res.json({ card: { ...card } });
+  })
+);
+
+/** 错因类型白名单与建议（AI 失败时用本地规则兜底） */
+const WHY_TYPES = ['概念混淆', '记忆不牢', '审题遗漏', '计算或推导失误', '方法不熟', '表达不到位', '粗心'];
+
+const WHY_ADVICE = {
+  概念混淆: '把易混概念做成对比卡，专门练区分',
+  记忆不牢: '用挖空回忆 + 间隔重复，别只读不想',
+  审题遗漏: '先划出题干限定词再作答',
+  计算或推导失误: '放慢一步一检查，写出中间过程',
+  方法不熟: '回看同类题步骤，用自己的话复述一遍',
+  表达不到位: '按「要点 + 例子」组织答案',
+  粗心: '提交前留 30 秒专门检查',
+};
+
+/** 本地错因推断（AI 不可用或返回异常时兜底） */
+function guessWhyType(text) {
+  const t = String(text || '');
+  if (/混淆|记混|搞混|分不清|弄混|张冠李戴/.test(t)) return '概念混淆';
+  if (/忘|记不住|背不下|想不起|记不牢/.test(t)) return '记忆不牢';
+  if (/看错|审题|没看清|漏看|读题|题目问/.test(t)) return '审题遗漏';
+  if (/算错|计算|推导|公式用错|代错/.test(t)) return '计算或推导失误';
+  if (/不会做|没思路|方法|步骤|无从下手/.test(t)) return '方法不熟';
+  if (/写不出|表达|答不全|说不清|写不全/.test(t)) return '表达不到位';
+  if (/粗心|马虎|大意|手快/.test(t)) return '粗心';
+  return '记忆不牢';
+}
+
+/** 取卡片对应的题目结构（复习相关的 AI 调用共用） */
+function cardQuestion(card) {
+  const d = card.detail || {};
+  return {
+    type: card.type,
+    stem: card.front,
+    answer: d.correctAnswer,
+    analysis: d.analysis,
+    material: d.material,
+    options: d.options,
+    points: d.points,
+  };
+}
+
+/**
+ * 复习作答判定（客观校准）：客观题本地判定，主观题交 AI 快速判定。
+ * 结果直接决定排期（对 → 记得推进；错 → 忘了回退），并计入客观正确率。
+ */
+router.post(
+  '/reviews/:id/check',
+  wrap(async (req, res) => {
+    const card = store.findReview(req.params.id);
+    if (!card) throw httpError(404, '复习卡片不存在');
+
+    const question = cardQuestion(card);
+    const answer = req.body?.answer;
+    let graded = judgeObjective(question, answer);
+    let byAI = false;
+    if (!graded) {
+      const { system, user, temperature } = buildReviewCheckPrompt({
+        subject: card.subject,
+        question,
+        studentAnswer: answer,
+      });
+      const data = await chatJSON({ system, user, temperature, maxTokens: 1024, label: '复习作答判定' });
+      graded = {
+        correct: Boolean(data?.correct),
+        score: Number(data?.score) || 0,
+        reason: String(data?.comment || '').trim(),
+      };
+      byAI = true;
+    }
+
+    const result = graded.correct ? 'known' : 'forgot';
+    store.upsertReview(card.id, {
+      ...scheduleReview(card, result),
+      objective: bumpObjective(card, graded.correct, byAI ? 'ai' : 'local'),
+      updatedAt: new Date().toISOString(),
+    });
+    store.save();
+
+    console.log(`[review] 作答判定 ${card.knowledge || card.id} → ${graded.correct ? '正确' : '错误'}${byAI ? '（AI）' : '（本地）'}`);
+    res.json({
+      correct: graded.correct,
+      byAI,
+      comment: graded.reason || '',
+      correctAnswerText: formatAnswer(question),
+      card: { ...card },
+    });
+  })
+);
+
+/** 挖空回忆：把答案要点拆成「提示词 → 要点」，AI 生成后缓存到卡片上 */
+router.post(
+  '/reviews/:id/cloze',
+  wrap(async (req, res) => {
+    const card = store.findReview(req.params.id);
+    if (!card) throw httpError(404, '复习卡片不存在');
+
+    if (!card.cloze?.points?.length) {
+      const { system, user, temperature } = buildClozePrompt({ subject: card.subject, question: cardQuestion(card) });
+      const data = await chatJSON({ system, user, temperature, maxTokens: 1024, label: '挖空要点' });
+      const points = (data?.points || [])
+        .map((p) => ({ hint: String(p?.hint || '').trim(), answer: String(p?.answer || '').trim() }))
+        .filter((p) => p.hint && p.answer)
+        .slice(0, 5);
+      if (!points.length) throw httpError(500, 'AI 未能拆出要点，请重试');
+      store.upsertReview(card.id, {
+        cloze: { points, createdAt: new Date().toISOString() },
+        mode: 'cloze',
+        updatedAt: new Date().toISOString(),
+      });
+      store.save();
+    }
+    res.json({ card: { ...card } });
+  })
+);
+
+/** AI 助记：口诀 / 首字缩写 / 类比 */
+router.post(
+  '/reviews/:id/mnemonic',
+  wrap(async (req, res) => {
+    const card = store.findReview(req.params.id);
+    if (!card) throw httpError(404, '复习卡片不存在');
+
+    if (!card.mnemonic || req.body?.refresh) {
+      const { system, user, temperature } = buildMnemonicPrompt({ subject: card.subject, question: cardQuestion(card) });
+      const data = await chatJSON({ system, user, temperature, maxTokens: 1024, label: 'AI 助记' });
+      const mnemonic = String(data?.mnemonic || '').trim();
+      if (!mnemonic) throw httpError(500, 'AI 未生成助记内容，请重试');
+      store.upsertReview(card.id, {
+        mnemonic: {
+          mnemonic,
+          association: String(data?.association || '').trim(),
+          keywords: (data?.keywords || []).map((k) => String(k).trim()).filter(Boolean).slice(0, 6),
+          createdAt: new Date().toISOString(),
+        },
+        updatedAt: new Date().toISOString(),
+      });
+      store.save();
+    }
+    res.json({ card: { ...card } });
+  })
+);
+
+/** 费曼复述：用自己的话讲一遍，AI 按要点评分并据此排期 */
+router.post(
+  '/reviews/:id/feynman',
+  wrap(async (req, res) => {
+    const card = store.findReview(req.params.id);
+    if (!card) throw httpError(404, '复习卡片不存在');
+
+    const text = String(req.body?.text || '').trim();
+    if (!text) throw httpError(400, '请先用自己的话写一遍');
+
+    const { system, user, temperature } = buildFeynmanPrompt({
+      subject: card.subject,
+      question: cardQuestion(card),
+      text,
+    });
+    const data = await chatJSON({ system, user, temperature, maxTokens: 1536, label: '费曼复述' });
+
+    const score = clampInt(data?.score, 0, 100);
+    const result = score >= 80 ? 'known' : score >= 60 ? 'fuzzy' : 'forgot';
+    const feynman = {
+      score,
+      hit: (data?.hit || []).map((x) => String(x).trim()).filter(Boolean).slice(0, 8),
+      missing: (data?.missing || []).map((x) => String(x).trim()).filter(Boolean).slice(0, 8),
+      comment: String(data?.comment || '').trim(),
+      text: text.slice(0, 500),
+      at: new Date().toISOString(),
+    };
+
+    store.upsertReview(card.id, {
+      ...scheduleReview(card, result),
+      feynman,
+      objective: bumpObjective(card, score >= 60, 'feynman'),
+      updatedAt: new Date().toISOString(),
+    });
+    store.save();
+
+    console.log(`[review] 费曼复述 ${card.knowledge || card.id} → ${score} 分（${result}）`);
+    res.json({ ...feynman, result, card: { ...card } });
+  })
+);
+
+/** 错因归纳：记录「我为什么错」，AI 归类后用于统计与针对性建议 */
+router.post(
+  '/reviews/:id/why',
+  wrap(async (req, res) => {
+    const card = store.findReview(req.params.id);
+    if (!card) throw httpError(404, '复习卡片不存在');
+
+    const text = String(req.body?.text || '').trim();
+    if (!text) throw httpError(400, '请先写下错因');
+
+    // AI 归类失败时降级为本地关键词推断，保证这一步永远能记下来
+    let type = '';
+    let advice = '';
+    try {
+      const { system, user, temperature } = buildWhyPrompt({
+        subject: card.subject,
+        question: cardQuestion(card),
+        text,
+      });
+      const data = await chatJSON({ system, user, temperature, maxTokens: 512, label: '错因归纳' });
+      type = String(data?.type || '').trim();
+      advice = String(data?.advice || '').trim();
+    } catch (err) {
+      console.warn(`[review] 错因归纳 AI 失败，改用本地推断：${err.message}`);
+    }
+    if (!WHY_TYPES.includes(type)) type = guessWhyType(text);
+    if (!advice) advice = WHY_ADVICE[type] || '';
+
+    const entry = {
+      text: text.slice(0, 300),
+      type,
+      advice,
+      at: new Date().toISOString(),
+    };
+
+    store.upsertReview(card.id, {
+      whyLogs: [...(card.whyLogs || []), entry].slice(-20),
+      updatedAt: new Date().toISOString(),
+    });
+    store.save();
+
+    res.json({ entry, card: { ...card } });
+  })
+);
+
+/** 易混对比卡：AI 从现有知识点里找出最容易混的组合，生成专项区分卡 */
+router.post(
+  '/reviews/confusions',
+  wrap(async (req, res) => {
+    const subject = String(req.body?.subject || '').trim();
+    const pool = store.getReviews().filter((c) => !subject || String(c.subject || '').trim() === subject);
+    const points = [...new Set(pool.map((c) => String(c.knowledge || '').trim()).filter(Boolean))];
+    if (points.length < 2) throw httpError(400, '知识点太少（至少 2 个），先同步更多错题再生成');
+
+    const { system, user, temperature } = buildConfusionPrompt({ subject, points });
+    const data = await chatJSON({ system, user, temperature, maxTokens: 2048, label: '易混对比卡' });
+    const pairs = (data?.pairs || []).filter((p) => p?.a && p?.b && p?.front).slice(0, 5);
+    if (!pairs.length) throw httpError(500, 'AI 未找出易混概念，请重试');
+
+    const today = dayStr();
+    const now = new Date().toISOString();
+    let added = 0;
+    let skipped = 0;
+    for (const p of pairs) {
+      const knowledge = `${String(p.a).trim()} vs ${String(p.b).trim()}`;
+      if (store.getReviews().some((c) => c.source === 'confusion' && c.knowledge === knowledge)) {
+        skipped += 1;
+        continue;
+      }
+      store.addReview({
+        id: store.uid('rev'),
+        source: 'confusion',
+        mode: 'confusion',
+        subject,
+        type: 'contrast',
+        knowledge,
+        front: String(p.front).trim(),
+        back: `${String(p.back || '').trim()}${p.tip ? `\n记忆提示：${String(p.tip).trim()}` : ''}`,
+        skeleton: String(p.tip || '').trim(),
+        detail: {
+          options: [],
+          material: '',
+          code: '',
+          language: '',
+          points: 0,
+          analysis: String(p.back || '').trim(),
+          correctAnswer: '',
+          explanation: null,
+        },
+        stability: 1.2,
+        difficulty: 5,
+        ease: 2.5,
+        interval: 0,
+        streak: 0,
+        lapses: 0,
+        reviews: 0,
+        mastery: 0,
+        leech: false,
+        objective: { checks: 0, correct: 0, byMode: {} },
+        whyLogs: [],
+        cloze: null,
+        mnemonic: null,
+        feynman: null,
+        due: today,
+        lastResult: '',
+        lastReviewedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+      added += 1;
+    }
+
+    store.save();
+    console.log(`[review] 易混对比卡 · 新增 ${added} 张 · 跳过 ${skipped} 张`);
+    res.json({ added, skipped, total: store.getReviews().length });
   })
 );
 

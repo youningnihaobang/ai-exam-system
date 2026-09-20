@@ -81,14 +81,22 @@ const state = {
   historySubject: '', // 做题历史左栏选中的科目（'' = 全部科目）
   mistakes: [],
   mistakeFilter: 'all',
+  mistakeRetry: {}, // 错题重做状态：{ [mistakeId]: { answer, result } }
   // 复习 / 闪卡
   reviewCards: [], // 全部卡片（含排期）
   reviewStats: null,
   reviewMode: 'today', // today | all
   reviewSubject: '', // 左栏选中的科目
-  reviewSession: null, // { queue: [id], pos, done, known, fuzzy, forgot }
+  reviewSession: null, // { queue: [id], pos, done, known, fuzzy, forgot, correct }
   reviewById: new Map(),
   reviewRevealed: false,
+  reviewDue: [], // 今日到期队列（服务端已按知识点交错）
+  reviewPanel: '', // 卡片交互面板：answer | cloze | mnemonic | feynman | why
+  reviewShowOptions: false, // 选择题选项是否已揭示（默认先隐藏，逼自己回忆）
+  reviewDraft: {}, // 复习作答草稿 { [cardId]: string | string[] }
+  reviewFeedback: null, // 作答判定结果
+  reviewFeynmanText: '',
+  reviewWhyText: '',
   variantAnswers: {},
   expanded: {},
   collapsedSubjects: {}, // 试卷列表「按科目」分组的折叠状态：{ [科目名]: true }
@@ -420,14 +428,17 @@ function bindGlobal() {
   // 复习 / 闪卡
   $('#btnRefreshReviews').addEventListener('click', loadReviews);
   $('#btnSyncReviews').addEventListener('click', syncReviews);
+  $('#btnConfusion').addEventListener('click', genConfusions);
   $('#reviewPane').addEventListener('click', onReviewAction);
+  $('#reviewPane').addEventListener('input', onReviewInput);
+  $('#reviewPane').addEventListener('change', onReviewInput);
   $$('#view-review .filters .chip').forEach((chip) =>
     chip.addEventListener('click', () => {
       $$('#view-review .filters .chip').forEach((c) => c.classList.remove('active'));
       chip.classList.add('active');
       state.reviewMode = chip.dataset.rmode;
       state.reviewSession = null;
-      state.reviewRevealed = false;
+      resetCardUI();
       renderReviews();
     })
   );
@@ -2169,32 +2180,47 @@ const todayStr = () => {
 };
 
 async function loadReviews() {
-  const q = state.reviewSubject ? `?subject=${encodeURIComponent(state.reviewSubject)}` : '';
+  const base = state.reviewSubject ? `?subject=${encodeURIComponent(state.reviewSubject)}` : '';
+  const dueUrl = `/reviews${base ? `${base}&due=1` : '?due=1'}`;
   try {
-    const { cards, stats } = await api('/reviews' + q);
-    state.reviewCards = cards;
-    state.reviewStats = stats;
-    state.reviewById = new Map(cards.map((c) => [c.id, c]));
-    $('#reviewBadge').textContent = stats.due ? String(stats.due) : '';
+    // 两次请求：全量用于卡片库与统计；due=1 由服务端按知识点交错好，用作复习队列
+    const [all, due] = await Promise.all([api('/reviews' + base), api(dueUrl)]);
+    state.reviewCards = all.cards;
+    state.reviewStats = all.stats;
+    state.reviewDue = due.cards;
+    state.reviewById = new Map([...all.cards, ...due.cards].map((c) => [c.id, c]));
+    $('#reviewBadge').textContent = all.stats.due ? String(all.stats.due) : '';
     if (state.view === 'review') renderReviews();
   } catch (e) {
     /* 忽略 */
   }
 }
 
-/** 今天该复习的卡片（逾期优先，其次按到期日） */
+/** 今天的复习队列（服务端已交错；兜底在前端过滤） */
 function reviewDueCards() {
+  if (state.reviewDue && state.reviewDue.length) return state.reviewDue;
   const today = todayStr();
   return state.reviewCards
     .filter((c) => String(c.due || today) <= today)
     .sort((a, b) => String(a.due || '').localeCompare(String(b.due || '')) || (b.lapses || 0) - (a.lapses || 0));
 }
 
+/** 重置当前卡片的所有交互态（面板 / 草稿 / 判定结果 / 揭晓） */
+function resetCardUI() {
+  state.reviewRevealed = false;
+  state.reviewPanel = '';
+  state.reviewShowOptions = false;
+  state.reviewFeynmanText = '';
+  state.reviewDraft = {};
+  state.reviewFeedback = null;
+  state.reviewWhyOpen = false;
+}
+
 function startReviewSession(cards) {
   const list = (cards || []).slice(0, 30);
   if (!list.length) return toast('今天没有需要复习的卡片', true);
-  state.reviewSession = { queue: list.map((c) => c.id), pos: 0, done: 0, known: 0, fuzzy: 0, forgot: 0 };
-  state.reviewRevealed = false;
+  state.reviewSession = { queue: list.map((c) => c.id), pos: 0, done: 0, known: 0, fuzzy: 0, forgot: 0, correct: 0 };
+  resetCardUI();
   renderReviews();
 }
 
@@ -2208,9 +2234,60 @@ function renderReviewStats() {
   el.innerHTML = `
     <span class="rs"><b>${st.due}</b> 今日待复习</span>
     <span class="rs"><b>${st.total}</b> 卡片总数</span>
+    <span class="rs"><b>${st.mastery}%</b> 平均掌握度</span>
     <span class="rs"><b>${st.learned}</b> 已进入长间隔</span>
+    <span class="rs"><b>${st.leeches}</b> 顽固卡</span>
     <span class="rs"><b>${st.reviews}</b> 累计复习次数</span>
     <span class="rs"><b>${st.lapses}</b> 累计遗忘</span>`;
+}
+
+/** 记忆看板：未来 7 天到期预测 + 遗忘风险榜 + 错因分布 */
+function renderReviewBoard() {
+  const el = $('#reviewBoard');
+  const st = state.reviewStats;
+  if (!el) return;
+  if (!st || !st.total) {
+    el.innerHTML = '';
+    return;
+  }
+
+  const max = Math.max(1, ...st.forecast.map((f) => f.count));
+  const bars = st.forecast
+    .map(
+      (f) => `
+      <div class="fx-bar" title="${f.date} · ${f.count} 张">
+        <div class="fx-col"><i style="height:${Math.round((f.count / max) * 100)}%"></i></div>
+        <span class="fx-n">${f.count}</span>
+        <span class="fx-d">${f.date.slice(5)}</span>
+      </div>`
+    )
+    .join('');
+
+  const risky = (st.risky || [])
+    .slice(0, 6)
+    .map(
+      (r) =>
+        `<div class="risk-row"><span class="rk">${esc(r.knowledge)}</span><span class="rd">逾期 ${r.due} · 遗忘 ${r.lapses} · 间隔 ${r.avgInterval} 天 · 掌握 ${r.avgMastery}%</span></div>`
+    )
+    .join('');
+
+  const errs = (st.errorTypes || [])
+    .slice(0, 8)
+    .map((e) => `<span class="chip-item">${esc(e.type)} ${e.count}</span>`)
+    .join('');
+
+  el.innerHTML = `
+    <div class="board">
+      <div class="board-box">
+        <div class="board-title">未来 7 天到期预测</div>
+        <div class="fx">${bars}</div>
+      </div>
+      <div class="board-box">
+        <div class="board-title">遗忘风险榜（优先复习）</div>
+        ${risky || '<div class="doc-empty">暂无数据</div>'}
+      </div>
+      ${errs ? `<div class="board-box"><div class="board-title">错因分布</div><div class="chips">${errs}</div></div>` : ''}
+    </div>`;
 }
 
 function renderReviewNav() {
@@ -2229,9 +2306,10 @@ function renderReviewNav() {
 function renderReviews() {
   renderReviewStats();
   renderReviewNav();
+  renderReviewBoard();
 
   const el = $('#reviewPane');
-  if (state.reviewMode === 'all') {
+  if (state.reviewMode === 'all' || state.reviewMode === 'leech') {
     el.innerHTML = allCardsHTML();
     return;
   }
@@ -2267,49 +2345,276 @@ function renderReviews() {
   el.innerHTML = flashCardHTML(card, s);
 }
 
+/* ---------- 卡片各面板 ---------- */
+
+/** 选择题选项：默认隐藏，逼自己先回忆（生成效应） */
+function flashOptionsHTML(card) {
+  const options = (card.detail || {}).options || [];
+  if (!options.length) return '';
+  if (state.reviewPanel === 'answer') return '';
+  if (!state.reviewShowOptions && !state.reviewRevealed) {
+    return `<div class="opt-hidden"><button class="ghost small" data-act="show-options">先自己想，点这里看选项（${options.length} 个）</button></div>`;
+  }
+  return `<div class="options">${options
+    .map((o, j) => `<div class="opt static"><span class="letter">${letter(j)}.</span><span>${esc(o)}</span></div>`)
+    .join('')}</div>`;
+}
+
+/** 通用作答控件（复习作答 / 错题重做共用）；attr 决定事件用哪个 data 属性定位 */
+function answerControlsHTML(q, key, draft, attr = 'data-rc') {
+  const A = `${attr}="${key}"`;
+  if (q.type === 'single' || q.type === 'multiple') {
+    const type = q.type === 'single' ? 'radio' : 'checkbox';
+    return `<div class="options">${(q.options || [])
+      .map((o, j) => {
+        const L = letter(j);
+        const checked = q.type === 'single' ? draft === L : Array.isArray(draft) && draft.includes(L);
+        return `<label class="opt"><input type="${type}" name="${key}" value="${L}" ${A} ${
+          checked ? 'checked' : ''
+        } /><span class="letter">${L}.</span><span>${esc(o)}</span></label>`;
+      })
+      .join('')}</div>`;
+  }
+  if (q.type === 'judge') {
+    return `<div class="options">
+      <label class="opt"><input type="radio" name="${key}" value="true" ${A} ${
+      draft === 'true' ? 'checked' : ''
+    } /><span>正确</span></label>
+      <label class="opt"><input type="radio" name="${key}" value="false" ${A} ${
+      draft === 'false' ? 'checked' : ''
+    } /><span>错误</span></label>
+    </div>`;
+  }
+  if (q.type === 'blank' || q.type === 'fillcode') {
+    const n = Math.max(1, Array.isArray(q.answer) ? q.answer.length : 1);
+    const arr = Array.isArray(draft) ? draft : [];
+    return `<div class="blank-inputs">${Array.from({ length: n })
+      .map((_, j) => `<input ${A} data-idx="${j}" value="${esc(arr[j] || '')}" placeholder="第 ${j + 1} 空" />`)
+      .join('')}</div>`;
+  }
+  return `<textarea class="answer-input" rows="5" ${A} placeholder="写下你的答案（AI 会判定是否达到得分要点）">${esc(
+    typeof draft === 'string' ? draft : ''
+  )}</textarea>`;
+}
+
+/** 「我自己答一遍」的作答控件（客观校准） */
+function cardAnswerAreaHTML(card) {
+  const d = card.detail || {};
+  return answerControlsHTML(
+    { type: card.type, options: d.options, answer: d.correctAnswer },
+    card.id,
+    state.reviewDraft[card.id]
+  );
+}
+
+/** 挖空回忆：只给提示词，自己补全要点 */
+function clozePanelHTML(card) {
+  const points = (card.cloze && card.cloze.points) || [];
+  if (!points.length) return '<div class="doc-empty">正在生成挖空要点…</div>';
+  const arr = Array.isArray(state.reviewDraft[card.id]) ? state.reviewDraft[card.id] : [];
+  return `
+    <div class="hint">只看提示词，把对应的要点写出来（意思对即可）。</div>
+    <div class="cloze-list">
+      ${points
+        .map(
+          (p, i) => `
+        <div class="cloze-row">
+          <span class="cz-hint">${esc(p.hint)}</span>
+          ${
+            state.reviewRevealed
+              ? `<span class="cz-answer ${clozeHit(arr[i], p.answer) ? 'ok' : 'bad'}">${esc(p.answer)}</span>`
+              : `<input data-rc="${card.id}" data-cz="${i}" value="${esc(arr[i] || '')}" placeholder="写出这个要点" />`
+          }
+        </div>`
+        )
+        .join('')}
+    </div>
+    ${
+      state.reviewRevealed
+        ? `<div class="flash-actions"><button class="primary" data-act="panel" data-panel="">收起</button></div>`
+        : `<div class="flash-actions"><button class="primary" data-act="cloze-submit">对答案</button>
+             <button class="ghost" data-act="panel" data-panel="">收起</button></div>`
+    }`;
+}
+
+/** 挖空作答的宽松判定：意思命中即算对 */
+function clozeHit(userText, answerText) {
+  const norm = (s) =>
+    String(s || '')
+      .replace(/[\s，。、；：（）()【】「」“”"'’,.;:!?！？—-]/g, '')
+      .toLowerCase();
+  const u = norm(userText);
+  const a = norm(answerText);
+  if (!u || !a) return false;
+  if (u.includes(a) || a.includes(u)) return true;
+  const grams = a.match(/[\u4e00-\u9fa5]{2,}/g) || [];
+  return grams.some((g) => g.length >= 2 && u.includes(g));
+}
+
+function mnemonicHTML(card, inline = false) {
+  const m = card.mnemonic;
+  if (!m) {
+    return inline
+      ? ''
+      : `<div class="doc-empty">还没有助记内容。</div>
+         <div class="flash-actions"><button class="primary" data-act="gen-mnemonic">生成 AI 助记</button>
+           <button class="ghost" data-act="panel" data-panel="">收起</button></div>`;
+  }
+  return `<div class="mnemonic-box">
+      <div><b>助记：</b>${esc(m.mnemonic)}</div>
+      ${m.association ? `<div><b>联想：</b>${esc(m.association)}</div>` : ''}
+      ${
+        (m.keywords || []).length
+          ? `<div class="chips">${m.keywords.map((k) => `<span class="chip-item">${esc(k)}</span>`).join('')}</div>`
+          : ''
+      }
+    </div>
+    ${
+      inline
+        ? ''
+        : `<div class="flash-actions"><button class="ghost small" data-act="gen-mnemonic" data-refresh="1">换个说法</button>
+             <button class="ghost small" data-act="panel" data-panel="">收起</button></div>`
+    }`;
+}
+
+function feynmanPanelHTML(card) {
+  const prev = card.feynman;
+  return `<div class="flash-panel">
+      <div class="hint">用自己的话把答案讲一遍（不用背原文，讲清要点即可），AI 会按要点评分并指出遗漏。</div>
+      <textarea class="answer-input" rows="6" data-rcf="${card.id}" placeholder="例如：这道题考的是……，关键在于……">${esc(
+    state.reviewFeynmanText || ''
+  )}</textarea>
+      ${prev ? `<div class="comment">上次复述：${prev.score} 分 · ${esc(prev.comment || '')}</div>` : ''}
+      <div class="flash-actions">
+        <button class="primary" data-act="gen-feynman">提交复述并评分</button>
+        <button class="ghost" data-act="panel" data-panel="">收起</button>
+      </div>
+    </div>`;
+}
+
+function whyPanelHTML(card) {
+  const logs = card.whyLogs || [];
+  return `<div class="flash-panel">
+      <div class="hint">写下这次为什么没记牢，AI 会归类到固定错因（用于统计与针对性建议）。</div>
+      <textarea class="answer-input" rows="3" data-rcw="${card.id}" placeholder="例如：把根本原因和主要原因记混了"></textarea>
+      ${
+        logs.length
+          ? `<div class="hint">历史错因：${logs
+              .slice(-3)
+              .map((w) => esc(`${w.type}（${w.text}）`))
+              .join('；')}</div>`
+          : ''
+      }
+      <div class="flash-actions">
+        <button class="primary" data-act="gen-why">提交错因</button>
+        <button class="ghost" data-act="panel" data-panel="">收起</button>
+      </div>
+    </div>`;
+}
+
 function flashCardHTML(card, s) {
   const d = card.detail || {};
+  const mastery = card.mastery == null ? 0 : card.mastery;
+  const isSubjective = ['term', 'short', 'discriminate', 'material', 'essay'].includes(card.type);
+  const panel = state.reviewPanel;
+  const fb = state.reviewFeedback;
+
+  const feedback = fb
+    ? `<div class="flash-feedback ${fb.bad ? 'bad' : 'ok'}">
+         <b>${esc(fb.title)}</b>
+         ${fb.comment ? `<div>${esc(fb.comment)}</div>` : ''}
+         ${fb.correctAnswerText ? `<div class="hint">参考答案：${esc(fb.correctAnswerText)}</div>` : ''}
+         <div class="flash-actions"><button class="primary" data-act="next-card">继续下一张</button></div>
+       </div>`
+    : '';
+
+  let panelHTML = '';
+  if (panel === 'answer') {
+    panelHTML = `<div class="flash-panel">${cardAnswerAreaHTML(card)}
+      <div class="flash-actions">
+        <button class="primary" data-act="check">提交作答（按客观结果排期）</button>
+        <button class="ghost" data-act="panel" data-panel="">收起</button>
+      </div></div>`;
+  } else if (panel === 'cloze') {
+    panelHTML = `<div class="flash-panel">${clozePanelHTML(card)}</div>`;
+  } else if (panel === 'mnemonic') {
+    panelHTML = `<div class="flash-panel">${mnemonicHTML(card)}</div>`;
+  } else if (panel === 'feynman') {
+    panelHTML = `<div class="flash-panel">${feynmanPanelHTML(card)}</div>`;
+  } else if (panel === 'why') {
+    panelHTML = `<div class="flash-panel">${whyPanelHTML(card)}</div>`;
+  }
+
+  const actions =
+    panel || fb
+      ? ''
+      : state.reviewRevealed
+        ? `<div class="flash-answer">
+             <div class="analysis"><b>答案：</b>${esc(card.back)}</div>
+             ${d.analysis ? `<div class="analysis"><b>解析：</b>${esc(d.analysis)}</div>` : ''}
+             ${
+               d.explanation && d.explanation.idea
+                 ? `<div class="comment"><b>讲解：</b>${esc(d.explanation.idea)}</div>`
+                 : ''
+             }
+             ${card.mnemonic ? mnemonicHTML(card, true) : ''}
+             ${
+               card.feynman
+                 ? `<div class="comment"><b>上次费曼复述：</b>${card.feynman.score} 分${
+                     card.feynman.comment ? ` · ${esc(card.feynman.comment)}` : ''
+                   }</div>`
+                 : ''
+             }
+           </div>
+           <div class="flash-actions">
+             <button class="ghost danger" data-act="grade" data-result="forgot">忘了</button>
+             <button class="ghost" data-act="grade" data-result="fuzzy">模糊</button>
+             <button class="primary" data-act="grade" data-result="known">记得</button>
+           </div>
+           <div class="flash-actions">
+             <button class="ghost small" data-act="panel" data-panel="mnemonic">AI 助记</button>
+             <button class="ghost small" data-act="panel" data-panel="feynman">费曼复述</button>
+             <button class="ghost small" data-act="panel" data-panel="why">记下错因</button>
+           </div>`
+        : `<div class="flash-actions">
+             <button class="primary" data-act="reveal">显示答案（先自己回忆）</button>
+             <button class="ghost" data-act="panel" data-panel="answer">我自己答一遍</button>
+             ${isSubjective ? `<button class="ghost" data-act="panel" data-panel="cloze">挖空回忆</button>` : ''}
+             <button class="ghost" data-act="panel" data-panel="mnemonic">AI 助记</button>
+             <button class="ghost" data-act="panel" data-panel="feynman">费曼复述</button>
+           </div>`;
+
   return `
     <div class="flash-card">
-      <div class="flash-progress">第 ${s.pos + 1} / ${s.queue.length} 张 · 本轮 记得 ${s.known} · 模糊 ${
-    s.fuzzy
-  } · 忘了 ${s.forgot}</div>
+      <div class="flash-progress">第 ${s.pos + 1} / ${s.queue.length} 张 · 本轮 记得 ${s.known} · 模糊 ${s.fuzzy} · 忘了 ${
+        s.forgot
+      } · 作答正确 ${s.correct || 0}</div>
       <div class="q-head">
-        <span class="q-type">${TYPE_LABELS[card.type] || card.type || '卡片'}</span>
+        <span class="q-type">${card.mode === 'confusion' ? '易混对比' : TYPE_LABELS[card.type] || card.type || '卡片'}</span>
         ${card.knowledge ? `<span class="tag">${esc(card.knowledge)}</span>` : ''}
+        ${card.leech ? '<span class="tag no" title="遗忘次数较多，建议换一种记忆方式">顽固卡 · 换种方式记</span>' : ''}
         ${card.paperTitle ? `<span class="q-points">${esc(card.paperTitle)}</span>` : ''}
-        <span class="q-points">间隔 ${card.interval || 0} 天 · 已复习 ${card.reviews || 0} 次</span>
+        <span class="q-points">间隔 ${card.interval || 0} 天 · 复习 ${card.reviews || 0} 次 · 掌握度 ${mastery}%</span>
       </div>
       <div class="q-stem">${esc(card.front)}</div>
       ${d.material ? `<div class="material-box"><b>材料：</b>${esc(d.material)}</div>` : ''}
       ${d.code ? codeHTML(d) : ''}
-      ${
-        state.reviewRevealed
-          ? `<div class="flash-answer">
-               <div class="analysis"><b>答案：</b>${esc(card.back)}</div>
-               ${d.analysis ? `<div class="analysis"><b>解析：</b>${esc(d.analysis)}</div>` : ''}
-               ${
-                 d.explanation && d.explanation.idea
-                   ? `<div class="comment"><b>讲解：</b>${esc(d.explanation.idea)}</div>`
-                   : ''
-               }
-             </div>
-             <div class="flash-actions">
-               <button class="ghost danger" data-act="grade" data-result="forgot">忘了</button>
-               <button class="ghost" data-act="grade" data-result="fuzzy">模糊</button>
-               <button class="primary" data-act="grade" data-result="known">记得</button>
-             </div>`
-          : `<div class="flash-actions"><button class="primary" data-act="reveal">显示答案（先自己回忆）</button></div>`
-      }
+      ${panel === 'answer' ? '' : flashOptionsHTML(card)}
+      ${feedback}
+      ${panelHTML}
+      ${actions}
     </div>`;
 }
 
 function allCardsHTML() {
-  if (!state.reviewCards.length) {
-    return '<div class="empty">还没有复习卡片：点上方「同步错题本」，把错题变成闪卡。</div>';
+  const list = state.reviewMode === 'leech' ? state.reviewCards.filter((c) => (c.lapses || 0) >= 4) : state.reviewCards;
+  if (!list.length) {
+    return state.reviewMode === 'leech'
+      ? '<div class="empty">还没有顽固卡（遗忘 4 次以上才会出现在这里）。</div>'
+      : '<div class="empty">还没有复习卡片：点上方「同步错题本」，把错题变成闪卡。</div>';
   }
   const today = todayStr();
-  return `<div class="list wide">${state.reviewCards
+  return `<div class="list wide">${list
     .map((c) => {
       const due = String(c.due || '');
       return `
@@ -2318,7 +2623,9 @@ function allCardsHTML() {
         <div class="rr-title">${esc(String(c.front || '').split('\n')[0].slice(0, 90))}</div>
         <div class="m">${TYPE_LABELS[c.type] || c.type || '卡片'}${c.knowledge ? ` · ${esc(c.knowledge)}` : ''} · ${esc(
         c.subject || '未分类'
-      )} · 到期 ${esc(due || '-')} · 间隔 ${c.interval || 0} 天 · 记得 ${c.streak || 0} 次 / 忘 ${c.lapses || 0} 次</div>
+      )} · 到期 ${esc(due || '-')} · 间隔 ${c.interval || 0} 天 · 掌握度 ${c.mastery || 0}% · 记得 ${
+        c.streak || 0
+      } 次 / 忘 ${c.lapses || 0} 次${c.leech ? ' · <b>顽固卡</b>' : ''}</div>
       </div>
       <div class="ops">
         <button class="ghost small" data-act="review-one">复习</button>
@@ -2337,18 +2644,44 @@ async function onReviewAction(e) {
   const row = btn.closest('.review-row');
   const s = state.reviewSession;
   const id = row ? row.dataset.id : s && s.queue[s.pos];
+  const card = id ? state.reviewById.get(id) : null;
 
   if (act === 'start' || act === 'restart') return startReviewSession(reviewDueCards());
 
   if (act === 'reveal') {
     state.reviewRevealed = true;
-    renderReviews();
-    return;
+    state.reviewPanel = '';
+    return renderReviews();
   }
 
+  if (act === 'show-options') {
+    state.reviewShowOptions = true;
+    return renderReviews();
+  }
+
+  if (act === 'panel') {
+    const target = btn.dataset.panel || '';
+    state.reviewPanel = state.reviewPanel === target ? '' : target;
+    if (target === 'cloze' && card && !((card.cloze || {}).points || []).length) return genCloze(card.id);
+    if (target === 'mnemonic' && card && !card.mnemonic) return genMnemonic(card.id);
+    return renderReviews();
+  }
+
+  if (act === 'cloze-submit') {
+    state.reviewRevealed = true;
+    return renderReviews();
+  }
+
+  if (act === 'check') return submitReviewAnswer(id);
+  if (act === 'next-card') return nextCard();
+  if (act === 'gen-cloze') return genCloze(id);
+  if (act === 'gen-mnemonic') return genMnemonic(id, btn.dataset.refresh === '1');
+  if (act === 'gen-feynman') return submitFeynman(id);
+  if (act === 'gen-why') return submitWhy(id);
+
   if (act === 'review-one') {
-    const card = state.reviewCards.find((c) => c.id === id);
-    if (card) startReviewSession([card]);
+    const one = state.reviewCards.find((c) => c.id === id);
+    if (one) startReviewSession([one]);
     return;
   }
 
@@ -2366,8 +2699,6 @@ async function onReviewAction(e) {
   }
 
   if (act !== 'grade') return;
-
-  const card = id ? state.reviewById.get(id) : null;
   if (!s || !card) return;
 
   const result = btn.dataset.result;
@@ -2381,11 +2712,212 @@ async function onReviewAction(e) {
     s.done += 1;
     if (result === 'forgot') s.queue.push(id); // 忘了：今天再现一次
     s.pos += 1;
-    state.reviewRevealed = false;
+    resetCardUI();
     renderReviews();
     loadReviews(); // 后台刷新统计与角标
   } catch (err) {
     toast(err.message, true);
+  }
+}
+
+/** 复习页的作答输入（客观校准 / 挖空 / 费曼 / 错因） */
+function onReviewInput(e) {
+  const el = e.target;
+  if (el.dataset.rcf !== undefined) {
+    state.reviewFeynmanText = el.value;
+    return;
+  }
+  if (el.dataset.rcw !== undefined) {
+    state.reviewWhyText = el.value;
+    return;
+  }
+
+  const id = el.dataset.rc;
+  if (!id) return;
+  const card = state.reviewById.get(id);
+  if (!card) return;
+
+  // 挖空回忆：每个要点一个输入框
+  if (el.dataset.cz !== undefined) {
+    const arr = Array.isArray(state.reviewDraft[id]) ? [...state.reviewDraft[id]] : [];
+    arr[Number(el.dataset.cz)] = el.value;
+    state.reviewDraft[id] = arr;
+    return;
+  }
+
+  if (card.type === 'multiple') {
+    state.reviewDraft[id] = $$(`input[data-rc="${id}"]:checked`, $('#reviewPane')).map((x) => x.value);
+  } else if (card.type === 'blank' || card.type === 'fillcode') {
+    state.reviewDraft[id] = $$(`input[data-rc="${id}"]`, $('#reviewPane')).map((x) => x.value);
+  } else {
+    state.reviewDraft[id] = el.value;
+  }
+}
+
+/** 推进到下一张卡片 */
+function nextCard() {
+  const s = state.reviewSession;
+  if (!s) return;
+  s.pos += 1;
+  resetCardUI();
+  renderReviews();
+  loadReviews();
+}
+
+/** 「我自己答一遍」：交服务端判定，结果直接决定排期（客观校准自评偏差） */
+async function submitReviewAnswer(id) {
+  const card = state.reviewById.get(id);
+  if (!card) return;
+  const answer = state.reviewDraft[id];
+  const empty =
+    answer == null || answer === '' || (Array.isArray(answer) && answer.every((x) => !String(x || '').trim()));
+  if (empty) return toast('先作答再提交', true);
+
+  busy('正在判定…');
+  try {
+    const r = await api(`/reviews/${encodeURIComponent(id)}/check`, {
+      method: 'POST',
+      body: JSON.stringify({ answer }),
+    });
+    if (r.card) Object.assign(card, r.card);
+    state.reviewFeedback = {
+      title: r.correct ? '作答正确，排期已推进' : '作答错误，已回到今天',
+      bad: !r.correct,
+      comment: r.comment || '',
+      correctAnswerText: r.correctAnswerText || '',
+    };
+    const s = state.reviewSession;
+    if (s) {
+      s.done += 1;
+      if (r.correct) {
+        s.correct += 1;
+        s.known += 1;
+      } else {
+        s.forgot += 1;
+        s.queue.push(id);
+      }
+    }
+    renderReviews();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    idle();
+  }
+}
+
+/** 挖空回忆：让 AI 把答案拆成可提示的要点 */
+async function genCloze(id) {
+  busy('AI 正在拆解记忆要点…');
+  try {
+    const { card: updated } = await api(`/reviews/${encodeURIComponent(id)}/cloze`, { method: 'POST' });
+    const card = state.reviewById.get(id);
+    if (card && updated) Object.assign(card, updated);
+    state.reviewPanel = 'cloze';
+    state.reviewDraft[id] = [];
+    renderReviews();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    idle();
+  }
+}
+
+/** AI 助记：口诀 / 首字缩写 / 类比 */
+async function genMnemonic(id, refresh = false) {
+  busy('AI 正在想助记办法…');
+  try {
+    const { card: updated } = await api(`/reviews/${encodeURIComponent(id)}/mnemonic`, {
+      method: 'POST',
+      body: JSON.stringify({ refresh }),
+    });
+    const card = state.reviewById.get(id);
+    if (card && updated) Object.assign(card, updated);
+    state.reviewPanel = 'mnemonic';
+    renderReviews();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    idle();
+  }
+}
+
+/** 费曼复述：讲一遍，AI 按要点评分并据此排期 */
+async function submitFeynman(id) {
+  const text = String(state.reviewFeynmanText || '').trim();
+  if (!text) return toast('先用你自己的话写一遍', true);
+
+  busy('AI 正在按要点评分…');
+  try {
+    const r = await api(`/reviews/${encodeURIComponent(id)}/feynman`, {
+      method: 'POST',
+      body: JSON.stringify({ text }),
+    });
+    const card = state.reviewById.get(id);
+    if (card && r.card) Object.assign(card, r.card);
+    state.reviewFeedback = {
+      title: `费曼复述 ${r.score} 分${r.score >= 80 ? '，讲清楚了' : r.score >= 60 ? '，还有遗漏' : '，需要重来'}`,
+      bad: r.score < 60,
+      comment: [r.comment, (r.missing || []).length ? `漏掉：${r.missing.join('；')}` : ''].filter(Boolean).join(' · '),
+      correctAnswerText: (card && card.back) || '',
+    };
+    const s = state.reviewSession;
+    if (s) {
+      s.done += 1;
+      if (r.result === 'known') {
+        s.known += 1;
+        s.correct += 1;
+      } else if (r.result === 'fuzzy') s.fuzzy += 1;
+      else {
+        s.forgot += 1;
+        s.queue.push(id);
+      }
+    }
+    renderReviews();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    idle();
+  }
+}
+
+/** 错因记录：AI 归类到固定类型，用于统计与建议 */
+async function submitWhy(id) {
+  const text = String(state.reviewWhyText || '').trim();
+  if (!text) return toast('先写下错因', true);
+
+  busy('AI 正在归类错因…');
+  try {
+    const r = await api(`/reviews/${encodeURIComponent(id)}/why`, {
+      method: 'POST',
+      body: JSON.stringify({ text }),
+    });
+    const card = state.reviewById.get(id);
+    if (card && r.card) Object.assign(card, r.card);
+    state.reviewWhyText = '';
+    toast(`已记录：${r.entry.type}${r.entry.advice ? ` · ${r.entry.advice}` : ''}`);
+    renderReviews();
+    loadReviews();
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    idle();
+  }
+}
+
+/** 易混对比卡：AI 找出最容易混的知识点组合，生成专项区分卡 */
+async function genConfusions() {
+  busy('AI 正在找出易混概念…');
+  try {
+    const r = await api('/reviews/confusions', {
+      method: 'POST',
+      body: JSON.stringify({ subject: state.reviewSubject }),
+    });
+    await loadReviews();
+    toast(`已生成易混对比卡：新增 ${r.added} 张${r.skipped ? ` · 跳过 ${r.skipped} 张（已存在）` : ''}`);
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    idle();
   }
 }
 
@@ -2395,7 +2927,7 @@ async function syncReviews() {
   try {
     const r = await api('/reviews/sync', { method: 'POST', body: JSON.stringify({ subject }) });
     state.reviewSession = null;
-    state.reviewRevealed = false;
+    resetCardUI();
     await loadReviews();
     toast(`同步完成：新增 ${r.added} 张${r.updated ? ` · 更新 ${r.updated} 张` : ''}，共 ${r.total} 张`);
   } catch (e) {
@@ -2582,9 +3114,18 @@ function renderMistakes() {
 
 function mistakeHTML(m) {
   const q = m.question || {};
+  const retry = (state.mistakeRetry || {})[m.id];
+  // 重做进行中：先不看答案与解析（避免「看懂了」替代「会做了」）
+  const hideAnswer = Boolean(retry && !retry.result);
+
   const options = (q.options || []).length
     ? `<div class="options">${q.options
-        .map((o, j) => `<div class="opt ${isRightOption(q, letter(j)) ? 'correct' : ''}"><span class="letter">${letter(j)}.</span><span>${esc(o)}</span></div>`)
+        .map(
+          (o, j) =>
+            `<div class="opt ${!hideAnswer && isRightOption(q, letter(j)) ? 'correct' : ''}"><span class="letter">${letter(
+              j
+            )}.</span><span>${esc(o)}</span></div>`
+        )
         .join('')}</div>`
     : '';
 
@@ -2594,6 +3135,13 @@ function mistakeHTML(m) {
       <span class="q-type">${TYPE_LABELS[q.type] || ''}</span>
       <span class="tag">${esc(m.subject || '')}</span>
       <span class="tag ${m.mastered ? 'ok' : 'no'}">${m.mastered ? '已掌握' : `错 ${m.wrongTimes || 1} 次`}</span>
+      ${
+        m.mastery == null
+          ? ''
+          : `<span class="tag" title="掌握度：综合连续记得次数、复习间隔与客观作答正确率">掌握度 ${m.mastery}%</span>`
+      }
+      ${m.leech ? `<span class="tag no" title="遗忘次数多，建议换一种记忆方式">顽固卡</span>` : ''}
+      ${m.nextDue ? `<span class="q-points">下次复习 ${esc(m.nextDue)}</span>` : ''}
       ${
         m.mastered && m.masteredByKnowledge
           ? `<span class="tag" title="做对同知识点的题目后自动掌握">知识点「${esc(m.masteredByKnowledge)}」做对后自动掌握</span>`
@@ -2605,22 +3153,47 @@ function mistakeHTML(m) {
     ${materialHTML(q)}
     ${codeHTML(q)}
     ${options}
-    <div class="answer-row">
-      <span class="mine"><b>你的答案：</b>${esc(answerText(q.type, m.studentAnswer))}</span>
-      <span class="std"><b>正确答案：</b>${esc(answerText(q.type, q.answer))}</span>
-    </div>
-    ${q.analysis ? `<div class="analysis"><b>解析：</b>${esc(q.analysis)}</div>` : ''}
+    ${
+      hideAnswer
+        ? '<div class="hint">重做中：答案与解析已暂时隐藏，先自己作答。</div>'
+        : `<div class="answer-row">
+             <span class="mine"><b>你的答案：</b>${esc(answerText(q.type, m.studentAnswer))}</span>
+             <span class="std"><b>正确答案：</b>${esc(answerText(q.type, q.answer))}</span>
+           </div>
+           ${q.analysis ? `<div class="analysis"><b>解析：</b>${esc(q.analysis)}</div>` : ''}`
+    }
 
     <div class="mistake-actions">
+      <button class="ghost small" data-act="retry">${retry ? '收起重做' : '重做一遍'}</button>
       <button class="ghost small" data-act="explain">${m.explanation ? '查看讲解' : 'AI 讲解'}</button>
       <button class="ghost small" data-act="variants">${m.variants ? '重新生成变式题' : '生成同类变式题'}</button>
       <button class="${m.mastered ? 'ghost' : 'good'} small" data-act="master">${m.mastered ? '取消掌握' : '标记已掌握'}</button>
       <button class="bad small" data-act="delete">删除</button>
     </div>
 
-    ${m.explanation ? explainHTML(m) : ''}
+    ${retry ? mistakeRetryHTML(m, retry) : ''}
+    ${hideAnswer || !m.explanation ? '' : explainHTML(m)}
     ${m.variants ? variantHTML(m) : ''}
   </div>`;
+}
+
+/** 错题重做面板：先作答，做对即掌握并推进复习排期 */
+function mistakeRetryHTML(m, st) {
+  const q = m.question || {};
+  return `
+    <div class="flash-panel">
+      <div class="hint">先不看解析自己做一遍：做对 → 标记已掌握并推进复习排期；做错 → 错误次数 +1、排期回到今天。</div>
+      ${answerControlsHTML(q, m.id, st.answer, 'data-mk')}
+      ${
+        st.result
+          ? `<div class="flash-feedback ${st.result.correct ? 'ok' : 'bad'}">
+               <b>${st.result.correct ? '答对了，已标记掌握' : '还是不对，再看看解析'}</b>
+               ${st.result.comment ? `<div>${esc(st.result.comment)}</div>` : ''}
+               <div class="hint">正确答案：${esc(st.result.correctAnswerText || '')}</div>
+             </div>`
+          : `<div class="flash-actions"><button class="primary small" data-act="retry-submit">提交作答</button></div>`
+      }
+    </div>`;
 }
 
 function explainHTML(m) {
@@ -2724,6 +3297,22 @@ function variantHTML(m) {
 }
 
 function onVariantInput(e) {
+  // 错题「重做一遍」的作答输入
+  const mk = e.target.dataset && e.target.dataset.mk;
+  if (mk) {
+    const m = state.mistakes.find((x) => x.id === mk);
+    const q = (m || {}).question || {};
+    const st = (state.mistakeRetry[mk] = state.mistakeRetry[mk] || { answer: '', result: null });
+    if (q.type === 'multiple') {
+      st.answer = $$(`input[data-mk="${mk}"]:checked`, $('#mistakeList')).map((x) => x.value);
+    } else if (q.type === 'blank' || q.type === 'fillcode') {
+      st.answer = $$(`input[data-mk="${mk}"]`, $('#mistakeList')).map((x) => x.value);
+    } else {
+      st.answer = e.target.value;
+    }
+    return;
+  }
+
   const qid = e.target.dataset && e.target.dataset.vqid;
   if (!qid) return;
   const card = e.target.closest('.mistake-card');
@@ -2753,7 +3342,28 @@ async function onMistakeAction(e) {
 
   const act = btn.dataset.act;
   try {
-    if (act === 'explain') {
+    if (act === 'retry') {
+      // 展开 / 收起重做面板（展开时隐藏答案与解析）
+      if (state.mistakeRetry[id]) delete state.mistakeRetry[id];
+      else state.mistakeRetry[id] = { answer: '', result: null };
+      renderMistakes();
+    } else if (act === 'retry-submit') {
+      const st = state.mistakeRetry[id];
+      const answer = st && st.answer;
+      const empty =
+        answer == null || answer === '' || (Array.isArray(answer) && answer.every((x) => !String(x || '').trim()));
+      if (!st) return;
+      if (empty) return toast('先作答再提交', true);
+
+      busy('正在判定…');
+      const r = await api(`/mistakes/${id}/retry`, { method: 'POST', body: JSON.stringify({ answer }) });
+      Object.assign(m, r.mistake || {});
+      st.result = { correct: r.correct, comment: r.comment, correctAnswerText: r.correctAnswerText };
+      if (r.card) m.mastery = r.card.mastery;
+      renderMistakes();
+      loadMistakes();
+      toast(r.correct ? '答对了，已标记掌握并推进复习排期' : '还差一点，看完解析再重做一遍');
+    } else if (act === 'explain') {
       if (m.explanation) {
         const box = $('.explain', card);
         if (box) box.classList.toggle('hidden');
