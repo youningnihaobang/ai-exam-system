@@ -14,6 +14,35 @@ const TYPE_LABELS = {
   code: '编程题',
 };
 
+/** 复习卡片状态（与 src/review.js 的 CARD_STATES 对应） */
+const CARD_STATE_LABELS = { new: '未学', learning: '学习中', review: '已毕业', relearning: '重学中' };
+
+/** 卡片是否处于分钟级学习步（学习 / 重学） */
+const inLearning = (card) => card && (card.state === 'learning' || card.state === 'relearning');
+
+/** 卡片到期时间戳（兼容只有日期字段的历史数据） */
+function cardDueTime(card) {
+  const t = new Date(card.dueAt || `${card.due || todayStr()}T00:00:00`).getTime();
+  return Number.isFinite(t) ? t : 0;
+}
+
+/** 到期文案：学习步显示「X 分钟后」，已毕业显示间隔天数 */
+function dueLabel(card) {
+  if (inLearning(card)) {
+    const mins = Math.round((cardDueTime(card) - Date.now()) / 60000);
+    return `下次复习 ${mins > 0 ? `${mins} 分钟后` : '现在'}`;
+  }
+  return `间隔 ${card.interval || 0} 天`;
+}
+
+/** 时间戳 → 本地「MM-DD HH:mm」（无法解析时原样返回） */
+function dueTextShort(value) {
+  const t = new Date(value);
+  if (Number.isNaN(t.getTime())) return String(value || '');
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(t.getMonth() + 1)}-${p(t.getDate())} ${p(t.getHours())}:${p(t.getMinutes())}`;
+}
+
 // 主观题（论述/材料）作答框更高
 const BIG_BOX_TYPES = ['essay', 'material'];
 /** 编程类题型：答题框用等宽字体，题干代码用 pre 展示 */
@@ -2196,13 +2225,13 @@ async function loadReviews() {
   }
 }
 
-/** 今天的复习队列（服务端已交错；兜底在前端过滤） */
+/** 今天的复习队列（服务端已交错；兜底在前端按到期时间过滤） */
 function reviewDueCards() {
   if (state.reviewDue && state.reviewDue.length) return state.reviewDue;
-  const today = todayStr();
+  const now = Date.now();
   return state.reviewCards
-    .filter((c) => String(c.due || today) <= today)
-    .sort((a, b) => String(a.due || '').localeCompare(String(b.due || '')) || (b.lapses || 0) - (a.lapses || 0));
+    .filter((c) => cardDueTime(c) <= now)
+    .sort((a, b) => cardDueTime(a) - cardDueTime(b) || (b.lapses || 0) - (a.lapses || 0));
 }
 
 /** 重置当前卡片的所有交互态（面板 / 草稿 / 判定结果 / 揭晓） */
@@ -2231,14 +2260,19 @@ function renderReviewStats() {
     el.innerHTML = '';
     return;
   }
+  const rt = st.retention || {};
+  const retentionText = rt.rate == null ? '—' : `${Math.round(rt.rate * 100)}%`;
   el.innerHTML = `
     <span class="rs"><b>${st.due}</b> 今日待复习</span>
     <span class="rs"><b>${st.total}</b> 卡片总数</span>
     <span class="rs"><b>${st.mastery}%</b> 平均掌握度</span>
+    <span class="rs" title="还在分钟级学习步里的卡片"><b>${st.learning || 0}</b> 短期记忆中</span>
+    <span class="rs" title="由复习日志统计：非「忘了」的复习占比"><b>${retentionText}</b> 真实保留率</span>
     <span class="rs"><b>${st.learned}</b> 已进入长间隔</span>
     <span class="rs"><b>${st.leeches}</b> 顽固卡</span>
     <span class="rs"><b>${st.reviews}</b> 累计复习次数</span>
-    <span class="rs"><b>${st.lapses}</b> 累计遗忘</span>`;
+    <span class="rs"><b>${st.lapses}</b> 累计遗忘</span>
+    <span class="rs" title="目标保留率越高，复习越密"><b>${Math.round((st.desiredRetention || 0.9) * 100)}%</b> 目标保留率</span>`;
 }
 
 /** 记忆看板：未来 7 天到期预测 + 遗忘风险榜 + 错因分布 */
@@ -2567,9 +2601,9 @@ function flashCardHTML(card, s) {
              }
            </div>
            <div class="flash-actions">
-             <button class="ghost danger" data-act="grade" data-result="forgot">忘了</button>
-             <button class="ghost" data-act="grade" data-result="fuzzy">模糊</button>
-             <button class="primary" data-act="grade" data-result="known">记得</button>
+             <button class="ghost danger" data-act="grade" data-result="forgot" title="完全想不起：回到学习步，1 分钟后重来">忘了</button>
+             <button class="ghost" data-act="grade" data-result="fuzzy" title="想起了但很吃力：间隔小幅增长">模糊</button>
+             <button class="primary" data-act="grade" data-result="known" title="顺利想起：间隔显著增长">记得</button>
            </div>
            <div class="flash-actions">
              <button class="ghost small" data-act="panel" data-panel="mnemonic">AI 助记</button>
@@ -2592,9 +2626,10 @@ function flashCardHTML(card, s) {
       <div class="q-head">
         <span class="q-type">${card.mode === 'confusion' ? '易混对比' : TYPE_LABELS[card.type] || card.type || '卡片'}</span>
         ${card.knowledge ? `<span class="tag">${esc(card.knowledge)}</span>` : ''}
+        ${inLearning(card) ? `<span class="tag">${CARD_STATE_LABELS[card.state]}</span>` : ''}
         ${card.leech ? '<span class="tag no" title="遗忘次数较多，建议换一种记忆方式">顽固卡 · 换种方式记</span>' : ''}
         ${card.paperTitle ? `<span class="q-points">${esc(card.paperTitle)}</span>` : ''}
-        <span class="q-points">间隔 ${card.interval || 0} 天 · 复习 ${card.reviews || 0} 次 · 掌握度 ${mastery}%</span>
+        <span class="q-points">${dueLabel(card)} · 复习 ${card.reviews || 0} 次 · 掌握度 ${mastery}%</span>
       </div>
       <div class="q-stem">${esc(card.front)}</div>
       ${d.material ? `<div class="material-box"><b>材料：</b>${esc(d.material)}</div>` : ''}
@@ -2613,19 +2648,22 @@ function allCardsHTML() {
       ? '<div class="empty">还没有顽固卡（遗忘 4 次以上才会出现在这里）。</div>'
       : '<div class="empty">还没有复习卡片：点上方「同步错题本」，把错题变成闪卡。</div>';
   }
-  const today = todayStr();
+  const now = Date.now();
   return `<div class="list wide">${list
     .map((c) => {
       const due = String(c.due || '');
+      const isDue = cardDueTime(c) <= now;
       return `
-    <div class="review-row ${due && due <= today ? 'due' : ''}" data-id="${esc(c.id)}">
+    <div class="review-row ${isDue ? 'due' : ''}" data-id="${esc(c.id)}">
       <div class="rr-main">
         <div class="rr-title">${esc(String(c.front || '').split('\n')[0].slice(0, 90))}</div>
         <div class="m">${TYPE_LABELS[c.type] || c.type || '卡片'}${c.knowledge ? ` · ${esc(c.knowledge)}` : ''} · ${esc(
         c.subject || '未分类'
-      )} · 到期 ${esc(due || '-')} · 间隔 ${c.interval || 0} 天 · 掌握度 ${c.mastery || 0}% · 记得 ${
+      )} · 到期 ${esc(due || '-')} · ${dueLabel(c)} · 掌握度 ${c.mastery || 0}% · 记得 ${
         c.streak || 0
-      } 次 / 忘 ${c.lapses || 0} 次${c.leech ? ' · <b>顽固卡</b>' : ''}</div>
+      } 次 / 忘 ${c.lapses || 0} 次${inLearning(c) ? ` · <b>${CARD_STATE_LABELS[c.state]}</b>` : ''}${
+        c.leech ? ' · <b>顽固卡</b>' : ''
+      }</div>
       </div>
       <div class="ops">
         <button class="ghost small" data-act="review-one">复习</button>
@@ -3141,7 +3179,7 @@ function mistakeHTML(m) {
           : `<span class="tag" title="掌握度：综合连续记得次数、复习间隔与客观作答正确率">掌握度 ${m.mastery}%</span>`
       }
       ${m.leech ? `<span class="tag no" title="遗忘次数多，建议换一种记忆方式">顽固卡</span>` : ''}
-      ${m.nextDue ? `<span class="q-points">下次复习 ${esc(m.nextDue)}</span>` : ''}
+      ${m.nextDue ? `<span class="q-points">下次复习 ${esc(dueTextShort(m.nextDue))}</span>` : ''}
       ${
         m.mastered && m.masteredByKnowledge
           ? `<span class="tag" title="做对同知识点的题目后自动掌握">知识点「${esc(m.masteredByKnowledge)}」做对后自动掌握</span>`

@@ -21,6 +21,20 @@ import { formatAnswer, isBlankAnswer, judgeObjective, normalizeQuestions } from 
 import { MAX_FILES, MAX_FILE_BYTES, MAX_OUTLINE_CHARS, extractText, isAccepted } from './parse.js';
 import { describeRemoved, describeShortfalls, duplicateStats, renumber, sortByType, trimToSpecs } from './validate.js';
 import { enqueue, findActiveJob, getJob, jobView, queueSnapshot } from './queue.js';
+import {
+  LEECH_LAPSES,
+  addDays,
+  countLearning,
+  dayStr,
+  ensureCardShape,
+  masteryOf,
+  needsCardShape,
+  normalizeRating,
+  resolveDesiredRetention,
+  retentionStats,
+  scheduleReview,
+  startOfDay,
+} from './review.js';
 import * as store from './store.js';
 
 const router = express.Router();
@@ -1426,6 +1440,7 @@ router.get(
     if (req.query.mastered === 'false') list = list.filter((m) => !m.mastered);
 
     // 关联复习卡片：带上掌握度与下次复习时间，便于错题本直接展示
+    ensureReviewShapes();
     const cardOf = new Map(store.getReviews().filter((c) => c.mistakeId).map((c) => [c.mistakeId, c]));
 
     // 老错题没有顶层 knowledge，从题目里补出来，供前端按知识点分组
@@ -1435,8 +1450,8 @@ router.get(
         return {
           ...m,
           knowledge: m.knowledge || m.question?.knowledge || '',
-          mastery: card ? (card.mastery == null ? masteryOf(card) : card.mastery) : null,
-          nextDue: card?.due || null,
+          mastery: card ? masteryOf(card) : null,
+          nextDue: card?.dueAt || card?.due || null,
           leech: Boolean(card && (card.lapses || 0) >= LEECH_LAPSES),
         };
       }),
@@ -1585,14 +1600,13 @@ async function gradeVariants({ mistakeId, answers }) {
     };
     if (allCorrect) m.variants.passedOnce = true;
 
-    // 变式题结果接入复习排期：全对推进，未全对回到今天（并计入客观正确率）
+    // 变式题结果接入复习排期：全对推进（good），未全对回到学习步（again）
     const card = store.findReviewByMistake(m.id);
     if (card) {
-      store.upsertReview(card.id, {
-        ...scheduleReview(card, allCorrect ? 'known' : 'forgot'),
-        objective: bumpObjective(card, allCorrect, 'variant'),
-        updatedAt: new Date().toISOString(),
-      });
+      store.upsertReview(
+        card.id,
+        applySchedule(card, allCorrect ? 'good' : 'again', { objective: bumpObjective(card, allCorrect, 'variant') })
+      );
       console.log(`[review] 变式题联动 ${card.knowledge || card.id} → ${allCorrect ? '排期推进' : '今天重来'}`);
     }
 
@@ -1652,11 +1666,10 @@ router.post(
     const now = new Date().toISOString();
     const card = store.findReviewByMistake(m.id);
     if (card) {
-      store.upsertReview(card.id, {
-        ...scheduleReview(card, graded.correct ? 'known' : 'forgot'),
-        objective: bumpObjective(card, graded.correct, 'retry'),
-        updatedAt: now,
-      });
+      store.upsertReview(
+        card.id,
+        applySchedule(card, graded.correct ? 'good' : 'again', { objective: bumpObjective(card, graded.correct, 'retry') })
+      );
     }
 
     if (graded.correct) {
@@ -1707,90 +1720,32 @@ router.delete(
 
 /* ------------------------------ 复习 / 闪卡（间隔重复） ------------------------------ */
 
-const REVIEW_RESULTS = ['forgot', 'fuzzy', 'known'];
-/** 单张卡片的最大复习间隔（天） */
-const REVIEW_MAX_INTERVAL = 180;
-
-/** 本地时区的日期字符串 YYYY-MM-DD */
-function dayStr(date = new Date()) {
-  const d = date instanceof Date ? date : new Date(date);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+/** 目标保留率：环境变量优先，其次 settings 集合，最后用默认 0.9 */
+function desiredRetention() {
+  const env = String(process.env.REVIEW_DESIRED_RETENTION || '').trim();
+  if (env) return resolveDesiredRetention(env);
+  return resolveDesiredRetention(store.getSettings()['review.desiredRetention']);
 }
 
-function addDays(day, n) {
-  const d = new Date(`${day}T00:00:00`);
-  d.setDate(d.getDate() + Number(n || 0));
-  return dayStr(d);
-}
-
-/** 顽固卡阈值：遗忘次数达到这个值，建议换一种记忆方式 */
-const LEECH_LAPSES = 4;
-
-const clampNum = (n, min, max) => Math.min(max, Math.max(min, Number(n) || 0));
-
-/**
- * 掌握度 0~100：连续记得 + 间隔长度 + 客观作答正确率，减去遗忘惩罚。
- * 用于替代「已掌握 / 未掌握」的二元判断。
- */
-function masteryOf(card) {
-  const streak = card.streak || 0;
-  const interval = card.interval || 0;
-  const lapses = card.lapses || 0;
-  const obj = card.objective || { checks: 0, correct: 0 };
-  const objRate = obj.checks ? obj.correct / obj.checks : null;
-
-  const base = Math.min(40, streak * 6);
-  const span = Math.min(30, (Math.log2(Math.max(1, interval)) / Math.log2(REVIEW_MAX_INTERVAL)) * 30);
-  const objective = objRate == null ? 12 : objRate * 30;
-  const penalty = Math.min(25, lapses * 4);
-
-  return Math.round(clampNum(base + span + objective - penalty, 0, 100));
-}
-
-/**
- * FSRS 风格的排期（近似实现）：维护稳定度 stability（天）与难度 difficulty（1~10），
- * 评分越高间隔增长越快，难度越高增长越慢；忘记则稳定度大幅回退并要求当天重来。
- */
-function scheduleReview(card, result) {
-  const today = dayStr();
-  const prevInterval = Number(card.interval) || 0;
-  let S = Number(card.stability) || Math.max(0.6, prevInterval || 1.2);
-  let D = Number(card.difficulty) || clampNum(5 + (card.lapses || 0) * 0.6, 1, 10);
-
-  if (result === 'forgot') {
-    D = clampNum(D + 0.8, 1, 10);
-    S = Math.max(0.4, S * 0.28);
-  } else if (result === 'fuzzy') {
-    D = clampNum(D + 0.15, 1, 10);
-    S = Math.max(1, S * (1 + 0.75 * (1 - D / 10)));
-  } else {
-    D = clampNum(D - 0.25, 1, 10);
-    S = Math.max(1.2, S * (1 + 2.2 * (1 - D / 10)));
+/** 历史卡片惰性补齐排期新字段；有实际变化才落盘 */
+function ensureReviewShapes() {
+  let changed = false;
+  for (const card of store.getReviews()) {
+    if (needsCardShape(card)) {
+      ensureCardShape(card);
+      changed = true;
+    }
   }
-  S = Math.min(REVIEW_MAX_INTERVAL * 1.5, Number(S.toFixed(2)));
+  if (changed) store.save();
+}
 
-  let interval = result === 'forgot' ? 0 : Math.round(S);
-  if (result !== 'forgot') {
-    // 间隔至少比上次略长（遗忘卡除外），避免长期卡片反复出现
-    interval = Math.max(interval, Math.ceil(prevInterval * 1.05), 1);
-  }
-  interval = Math.min(REVIEW_MAX_INTERVAL, interval);
-
-  const next = {
-    stability: S,
-    difficulty: D,
-    interval,
-    streak: result === 'forgot' ? 0 : (card.streak || 0) + 1,
-    lapses: (card.lapses || 0) + (result === 'forgot' ? 1 : 0),
-    reviews: (card.reviews || 0) + 1,
-    due: addDays(today, interval),
-    lastResult: result,
-    lastReviewedAt: new Date().toISOString(),
-    ease: Number((2.6 - (D - 5) * 0.15).toFixed(2)), // 兼容旧前端展示
+/** 统一排期入口：所有会推进排期的接口都走这里，保证规则一致 */
+function applySchedule(card, rating, extra = {}) {
+  return {
+    ...scheduleReview(card, rating, { desiredRetention: desiredRetention() }),
+    ...extra,
+    updatedAt: new Date().toISOString(),
   };
-  next.leech = next.lapses >= LEECH_LAPSES;
-  next.mastery = masteryOf({ ...card, ...next });
-  return next;
 }
 
 /** 记录一次「客观作答」结果（用于校准自评、统计正确率） */
@@ -1866,10 +1821,18 @@ router.get(
     const filter = String(req.query?.filter || '').trim();
     const dueOnly = filter === 'due' || ['1', 'true', 'yes'].includes(String(req.query?.due || '').toLowerCase());
     const today = dayStr();
+    const now = Date.now();
 
+    ensureReviewShapes();
     const pool = store.getReviews().filter((c) => !subject || String(c.subject || '').trim() === subject);
-    const isDue = (c) => String(c.due || today) <= today;
-    const masteryVal = (c) => (c.mastery == null ? masteryOf(c) : c.mastery);
+    // 到期按时间戳判定，学习步卡片的分钟级到期才能正确出现
+    const dueTime = (c) => {
+      const t = new Date(c.dueAt || `${c.due || today}T00:00:00`).getTime();
+      return Number.isFinite(t) ? t : 0;
+    };
+    const isDue = (c) => dueTime(c) <= now;
+    // 掌握度总是按当前规则重算，修正历史卡片存量字段
+    const masteryVal = (c) => masteryOf(c);
 
     // 未来 7 天到期预测（第 0 天含逾期）
     const forecast = [];
@@ -1917,6 +1880,11 @@ router.get(
       reviews: pool.reduce((s, c) => s + (c.reviews || 0), 0),
       leeches: pool.filter((c) => (c.lapses || 0) >= LEECH_LAPSES).length,
       mastery: pool.length ? Math.round(pool.reduce((s, c) => s + masteryVal(c), 0) / pool.length) : 0,
+      // 复习日志推出的真实保留率（无日志的卡片不参与）
+      retention: retentionStats(pool),
+      // 还在分钟级学习步里的卡片数
+      learning: countLearning(pool),
+      desiredRetention: desiredRetention(),
       forecast,
       risky,
       errorTypes: [...errorMap.entries()].map(([type, count]) => ({ type, count })).sort((a, b) => b.count - a.count),
@@ -1939,7 +1907,7 @@ router.get(
     else if (dueOnly) cards = cards.filter(isDue);
 
     cards = [...cards].sort((a, b) =>
-      String(a.due || '').localeCompare(String(b.due || '')) ||
+      dueTime(a) - dueTime(b) ||
       (filter === 'leech' ? (b.lapses || 0) - (a.lapses || 0) : String(b.createdAt || '').localeCompare(String(a.createdAt || '')))
     );
     // 到期复习队列：按知识点交错，避免连着出同一考点
@@ -1982,7 +1950,9 @@ router.post(
         questionId: m.questionId || '',
         subject: String(m.subject || '').trim(),
         ...faces,
-        // 排期状态（FSRS 风格）
+        // 排期状态（FSRS 风格 + 学习步）
+        state: 'new',
+        step: 0,
         stability: 1.2,
         difficulty: 5,
         ease: 2.5,
@@ -1999,8 +1969,11 @@ router.post(
         mnemonic: null,
         feynman: null,
         due: today,
+        dueAt: now,
         lastResult: '',
         lastReviewedAt: null,
+        lastElapsedDays: 0,
+        logs: [],
         createdAt: now,
         updatedAt: now,
       });
@@ -2020,10 +1993,10 @@ router.post(
     const card = store.findReview(req.params.id);
     if (!card) throw httpError(404, '复习卡片不存在');
 
-    const result = String(req.body?.result || '').trim();
-    if (!REVIEW_RESULTS.includes(result)) throw httpError(400, '评分只能是 forgot / fuzzy / known');
+    const rating = normalizeRating(req.body?.result);
+    if (!rating) throw httpError(400, '评分只能是 again / hard / good / easy（或 forgot / fuzzy / known）');
 
-    store.upsertReview(card.id, { ...scheduleReview(card, result), updatedAt: new Date().toISOString() });
+    store.upsertReview(card.id, applySchedule(card, rating));
     store.save();
     res.json({ card: { ...card } });
   })
@@ -2098,12 +2071,11 @@ router.post(
       byAI = true;
     }
 
-    const result = graded.correct ? 'known' : 'forgot';
-    store.upsertReview(card.id, {
-      ...scheduleReview(card, result),
-      objective: bumpObjective(card, graded.correct, byAI ? 'ai' : 'local'),
-      updatedAt: new Date().toISOString(),
-    });
+    const result = graded.correct ? 'good' : 'again';
+    store.upsertReview(
+      card.id,
+      applySchedule(card, result, { objective: bumpObjective(card, graded.correct, byAI ? 'ai' : 'local') })
+    );
     store.save();
 
     console.log(`[review] 作答判定 ${card.knowledge || card.id} → ${graded.correct ? '正确' : '错误'}${byAI ? '（AI）' : '（本地）'}`);
@@ -2188,7 +2160,8 @@ router.post(
     const data = await chatJSON({ system, user, temperature, maxTokens: 1536, label: '费曼复述' });
 
     const score = clampInt(data?.score, 0, 100);
-    const result = score >= 80 ? 'known' : score >= 60 ? 'fuzzy' : 'forgot';
+    // 复述得分 → 四档评分（分数越高间隔越长）
+    const result = score >= 90 ? 'easy' : score >= 80 ? 'good' : score >= 60 ? 'hard' : 'again';
     const feynman = {
       score,
       hit: (data?.hit || []).map((x) => String(x).trim()).filter(Boolean).slice(0, 8),
@@ -2198,12 +2171,10 @@ router.post(
       at: new Date().toISOString(),
     };
 
-    store.upsertReview(card.id, {
-      ...scheduleReview(card, result),
-      feynman,
-      objective: bumpObjective(card, score >= 60, 'feynman'),
-      updatedAt: new Date().toISOString(),
-    });
+    store.upsertReview(
+      card.id,
+      applySchedule(card, result, { feynman, objective: bumpObjective(card, score >= 60, 'feynman') })
+    );
     store.save();
 
     console.log(`[review] 费曼复述 ${card.knowledge || card.id} → ${score} 分（${result}）`);
@@ -2303,6 +2274,8 @@ router.post(
         stability: 1.2,
         difficulty: 5,
         ease: 2.5,
+        state: 'new',
+        step: 0,
         interval: 0,
         streak: 0,
         lapses: 0,
@@ -2315,8 +2288,11 @@ router.post(
         mnemonic: null,
         feynman: null,
         due: today,
+        dueAt: startOfDay(today),
         lastResult: '',
         lastReviewedAt: null,
+        lastElapsedDays: 0,
+        logs: [],
         createdAt: now,
         updatedAt: now,
       });
