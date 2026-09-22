@@ -10,6 +10,17 @@
   --bg: #f5f6fb;
   --card: #ffffff;
   --radius: 14px;
+  /* 安全区（刘海 / 圆角 / Home 指示条）留白：无安全区的设备与浏览器回退为 0 */
+  --safe-t: env(safe-area-inset-top, 0px);
+  --safe-r: env(safe-area-inset-right, 0px);
+  --safe-b: env(safe-area-inset-bottom, 0px);
+  --safe-l: env(safe-area-inset-left, 0px);
+}
+
+/* 避免 iOS 横屏时自动放大文字（会打乱窄屏下的折行与溢出判断） */
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 * {
@@ -39,7 +50,7 @@ p { margin: 0 0 8px; }
   display: flex;
   align-items: center;
   gap: 20px;
-  padding: 14px 24px;
+  padding: calc(14px + var(--safe-t)) calc(24px + var(--safe-r)) 14px calc(24px + var(--safe-l));
   background: #fff;
   border-bottom: 1px solid var(--line);
   position: sticky;
@@ -88,7 +99,7 @@ p { margin: 0 0 8px; }
 .status.ok { color: var(--success); }
 .status.bad { color: var(--danger); }
 
-main { padding: 24px; max-width: 1180px; margin: 0 auto; }
+main { padding: 24px calc(24px + var(--safe-r)) 24px calc(24px + var(--safe-l)); max-width: 1180px; margin: 0 auto; }
 
 .view.hidden, .hidden { display: none !important; }
 
@@ -110,6 +121,8 @@ main { padding: 24px; max-width: 1180px; margin: 0 auto; }
 .field input, .field select, .field textarea {
   font-family: inherit; font-size: 14px; color: var(--text);
   border: 1px solid var(--line); border-radius: 10px; padding: 9px 12px; background: #fff; outline: none;
+  /* 表单控件的 min-content 由默认 size=20 / 最长 option 决定，不置 0 会顶破 1fr 栅格列 */
+  min-width: 0;
 }
 .field input:focus, .field select:focus, .field textarea:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
 .field textarea { resize: vertical; }
@@ -145,6 +158,8 @@ main { padding: 24px; max-width: 1180px; margin: 0 auto; }
 .file-item .s.err { color: var(--danger); max-width: 40%; overflow: hidden; text-overflow: ellipsis; }
 
 .actions { display: flex; align-items: center; gap: 14px; margin-top: 8px; }
+/* 弹性子项默认 min-width: auto，内容（长文案 / 表单控件）会把它顶宽到溢出 */
+.actions > *, .side-head > *, .topbar-right > * { min-width: 0; }
 .total { font-size: 13px; color: var(--muted); }
 
 /* 按钮 */
@@ -169,7 +184,9 @@ button { font-family: inherit; }
 .layout {
   position: relative;
   display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 20px;
-  align-items: stretch; height: calc(100vh - 122px);
+  align-items: stretch;
+  height: calc(100vh - 122px); /* 不支持 dvh 的浏览器回退 */
+  height: calc(100dvh - 122px); /* 跟随移动浏览器可见视口（地址栏收放时不跳动） */
 }
 
 /* 侧边栏收起 / 展开 */
@@ -307,7 +324,7 @@ button { font-family: inherit; }
 .exam-footer {
   position: sticky; bottom: 0; z-index: 3;
   display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
-  margin-top: 16px; padding: 12px 0 14px;
+  margin-top: 16px; padding: 12px 0 calc(14px + var(--safe-b));
   border-top: 1px solid var(--line);
   background: #fff;
 }
@@ -450,7 +467,8 @@ button.danger { color: var(--danger); border-color: #fecaca; }
 .review-row .ops { display: flex; gap: 6px; flex-shrink: 0; }
 
 /* 记忆看板：7 天到期预测 + 风险榜 + 错因分布 */
-.board { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin-bottom: 16px; }
+/* minmax(min(240px, 100%), 1fr)：轨道不会超过容器宽度，窄屏下不再溢出 */
+.board { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr)); gap: 12px; margin-bottom: 16px; }
 .board-box { border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; background: #fbfcff; }
 .board-title { font-size: 13px; font-weight: 600; color: var(--muted); margin-bottom: 10px; }
 .fx { display: flex; gap: 8px; align-items: flex-end; height: 96px; }
@@ -492,24 +510,99 @@ button.danger { color: var(--danger); border-color: #fecaca; }
 
 /* 弹层 */
 .overlay { position: fixed; inset: 0; background: rgba(17, 24, 39, .45); display: grid; place-items: center; z-index: 50; }
-.overlay-box { background: #fff; border-radius: 14px; padding: 26px 34px; display: grid; place-items: center; gap: 14px; min-width: 220px; }
+.overlay-box { background: #fff; border-radius: 14px; padding: 26px 34px; display: grid; place-items: center; gap: 14px; min-width: min(220px, 100%); max-width: calc(100vw - 32px); }
 .overlay-box p { margin: 0; font-size: 14px; color: var(--muted); }
 .spinner { width: 34px; height: 34px; border: 3px solid var(--primary-soft); border-top-color: var(--primary); border-radius: 50%; animation: spin .9s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-.toast { position: fixed; left: 50%; bottom: 34px; transform: translateX(-50%); background: #111827; color: #fff; padding: 11px 20px; border-radius: 10px; font-size: 14px; z-index: 60; max-width: 80vw; }
+.toast { position: fixed; left: 50%; bottom: calc(34px + var(--safe-b)); transform: translateX(-50%); background: #111827; color: #fff; padding: 11px 20px; border-radius: 10px; font-size: 14px; z-index: 60; max-width: calc(100vw - 24px); }
 .toast.error { background: var(--danger); }
 
+/* ============================================================
+   窄屏（< 900px = 手机 / 平板竖屏）
+   单列布局 + 文档流内的侧栏收放按钮 + 触摸目标与输入字号
+   ============================================================ */
 @media (max-width: 900px) {
-  .grid { grid-template-columns: 1fr; }
-  .stat-grid { grid-template-columns: repeat(2, 1fr); }
-  .history-row { flex-wrap: wrap; }
-  .layout { grid-template-columns: 1fr; height: auto; }
-  .side-toggle { display: none; }
+  /* --- 布局：收敛为单列，侧栏收起后主内容占首屏 --- */
+  .layout { grid-template-columns: minmax(0, 1fr); gap: 12px; height: auto; }
   .side { overflow: visible; }
-  .main-col { overflow: visible; max-height: none; }
-  .subject-nav { max-height: none; }
-  #paperList { max-height: 420px; flex: none; }
-  .tabs { width: 100%; margin-left: 0; }
-  .topbar { flex-wrap: wrap; }
+  .main-col { overflow: visible; max-height: none; padding-right: 0; }
+  .subject-nav { max-height: 30vh; overflow-y: auto; }
+  #paperList { max-height: 40vh; flex: none; }
+
+  /* 桌面端绝对定位的小箭头在窄屏改为整行按钮：
+     既不与主内容重叠，也让「侧栏默认收起」变成可见可点的一步操作 */
+  .side-toggle {
+    position: static;
+    display: flex; align-items: center; justify-content: center; gap: 6px;
+    width: 100%; height: 44px;
+    font-size: 13px;
+  }
+  .layout.collapsed .side-toggle::after { content: '展开科目列表'; }
+  .layout:not(.collapsed) .side-toggle::after { content: '收起科目列表'; }
+
+  /* --- 页面留白（保留安全区留白） --- */
+  .topbar { flex-wrap: wrap; padding: calc(10px + var(--safe-t)) calc(14px + var(--safe-r)) 10px calc(14px + var(--safe-l)); }
+  main { padding: 16px calc(14px + var(--safe-r)) 16px calc(14px + var(--safe-l)); }
+  .card { padding: 16px; }
+
+  /* --- 网格收敛：minmax(0, 1fr) 保证轨道不被内容顶宽 --- */
+  .grid { grid-template-columns: minmax(0, 1fr); }
+  /* .real-opts .grid.two 特异性高于 .grid，必须单独覆盖，否则窄屏仍是两列 */
+  .real-opts .grid.two { grid-template-columns: minmax(0, 1fr); }
+  .stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .history-row { flex-wrap: wrap; }
+  .specs-head, .spec-row { grid-template-columns: minmax(0, 1fr) 84px 84px; gap: 10px; }
+  .spec-row .name { min-width: 0; }
+
+  /* --- 固定宽度子项在窄屏收缩 --- */
+  .score-text { min-width: 0; }
+  .cloze-row .cz-hint { flex: 0 0 100%; }
+  .subject-lib select.grow { min-width: 0; }
+
+  /* --- 换行与断词：长文案 / 长串不撑破卡片 --- */
+  .actions, .side-head, .filters, .review-row, .doc-item, .doc-item .ops { flex-wrap: wrap; }
+  .q-stem, .analysis, .comment, .opt span, .doc-item .n, .history-row .h-title { overflow-wrap: anywhere; }
+
+  /* --- 输入字号提到 16px：iOS Safari 聚焦不再自动放大（不禁用缩放） --- */
+  .field input, .field select, .field textarea, .spec-row input,
+  textarea.answer-box, .answer-input, .blank-inputs input, .cloze-row input,
+  .subject-lib select.grow, .model-pick select {
+    font-size: 16px;
+  }
+
+  /* --- 触摸目标 ≥44px（命中区即元素盒子，相邻控件不会互相覆盖） --- */
+  .q-nav { max-height: 96px; overflow-y: auto; }
+  .q-dot { width: 44px; height: 44px; font-size: 14px; }
+  .chip { min-height: 44px; padding: 10px 14px; }
+  button.small { min-height: 44px; padding: 10px 12px; }
+  .opt { min-height: 44px; padding: 12px 8px; }
+  .check-line { min-height: 44px; }
+  .file-item, .doc-item { min-height: 44px; }
+
+  /* --- 顶栏：导航入口横向滚动，五个入口全部可达 --- */
+  .tabs {
+    width: 100%; margin-left: 0;
+    flex-wrap: nowrap; overflow-x: auto; overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch; scrollbar-width: none;
+  }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tab { flex: none; }
+  .topbar-right { margin-left: 0; width: 100%; flex-wrap: wrap; }
+  .model-pick { min-width: 0; }
+  #modelPick { max-width: 100%; min-width: 0; }
+  .status { max-width: 100%; white-space: normal; }
+
+  /* --- 底部常驻操作条：保持吸底（.main-col 不再独立滚动，滚动落回页面） --- */
+  .exam-footer { position: sticky; bottom: 0; }
+}
+
+/* ============================================================
+   超窄压缩档（≤ 420px）：进一步收紧留白与列宽
+   ============================================================ */
+@media (max-width: 420px) {
+  main { padding: 12px calc(12px + var(--safe-r)) 12px calc(12px + var(--safe-l)); }
+  .card { padding: 14px; }
+  .actions { gap: 8px; }
+  .specs-head, .spec-row { grid-template-columns: minmax(0, 1fr) 72px 72px; gap: 8px; padding: 9px 10px; }
 }

@@ -473,36 +473,74 @@ function bindGlobal() {
   );
 }
 
-/** 侧边栏收起 / 展开：状态按视图分别记在 localStorage */
-function initSideToggles() {
-  const KEY = 'ui.sideCollapsed';
-  let saved = {};
+/** 侧栏收起 / 展开：状态按「断点 + 视图」分别记在 localStorage
+ *  窄屏与桌面两档互不覆盖；旧版扁平结构 { 视图: bool } 整体视为桌面档。
+ *  窄屏下某视图没有用户记录时默认收起，让主内容占首屏。 */
+const SIDE_KEY = 'ui.sideCollapsed';
+const SIDE_NARROW_QUERY = '(max-width: 900px)';
+
+/** 归一化存档为 { wide: {}, narrow: {} }；无法解析或无分桶结构的旧值都归入 wide */
+function readSideState(raw) {
+  let parsed;
   try {
-    saved = JSON.parse(localStorage.getItem(KEY) || '{}') || {};
+    parsed = typeof raw === 'string' ? JSON.parse(raw || '{}') : raw;
   } catch (e) {
-    saved = {};
+    parsed = null;
   }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { wide: {}, narrow: {} };
+  const hasBucket =
+    (parsed.wide && typeof parsed.wide === 'object') || (parsed.narrow && typeof parsed.narrow === 'object');
+  if (!hasBucket) return { wide: { ...parsed }, narrow: {} };
+  return { wide: { ...(parsed.wide || {}) }, narrow: { ...(parsed.narrow || {}) } };
+}
 
-  $$('.side-toggle').forEach((btn) => {
-    const key = btn.dataset.side;
-    const layout = btn.closest('.layout');
-    if (!layout) return;
+function initSideToggles() {
+  const mq = window.matchMedia(SIDE_NARROW_QUERY);
+  const store = readSideState(localStorage.getItem(SIDE_KEY));
+  const bucketOf = () => (mq.matches ? 'narrow' : 'wide');
 
-    const apply = (collapsed) => {
-      layout.classList.toggle('collapsed', collapsed);
-      btn.textContent = collapsed ? '»' : '«';
-      btn.title = collapsed ? '展开侧边栏' : '收起侧边栏';
-      saved[key] = collapsed;
-      try {
-        localStorage.setItem(KEY, JSON.stringify(saved));
-      } catch (e) {
-        /* 忽略存储失败 */
-      }
-    };
+  // 未见用户记录时：窄屏默认收起（主内容占首屏），桌面默认展开
+  const resolve = (key) => {
+    const saved = store[bucketOf()][key];
+    return saved === undefined ? mq.matches : Boolean(saved);
+  };
 
-    apply(Boolean(saved[key]));
-    btn.addEventListener('click', () => apply(!layout.classList.contains('collapsed')));
-  });
+  const persist = () => {
+    try {
+      localStorage.setItem(SIDE_KEY, JSON.stringify(store));
+    } catch (e) {
+      /* 忽略存储失败 */
+    }
+  };
+
+  const toggles = $$('.side-toggle')
+    .map((btn) => {
+      const key = btn.dataset.side;
+      const layout = btn.closest('.layout');
+      if (!layout) return null;
+
+      const apply = (collapsed) => {
+        layout.classList.toggle('collapsed', collapsed);
+        btn.textContent = collapsed ? '»' : '«';
+        btn.title = collapsed ? '展开侧边栏' : '收起侧边栏';
+      };
+
+      apply(resolve(key));
+      btn.addEventListener('click', () => {
+        const collapsed = !layout.classList.contains('collapsed');
+        apply(collapsed);
+        // 只写当前断点这一桶，不覆盖另一档的显式选择
+        store[bucketOf()][key] = collapsed;
+        persist();
+      });
+      return { key, apply };
+    })
+    .filter(Boolean);
+
+  // 跨断点时按新档位重新应用
+  const onBreakpoint = () => toggles.forEach(({ key, apply }) => apply(resolve(key)));
+  if (typeof mq.addEventListener === 'function') mq.addEventListener('change', onBreakpoint);
+  else if (typeof mq.addListener === 'function') mq.addListener(onBreakpoint); // 老 Safari 回退
 }
 
 function switchView(view) {
@@ -1688,8 +1726,15 @@ function gotoQuestion(i) {
 function scrollExamTop() {
   const pane = $('#examPane');
   const col = pane && pane.closest('.main-col');
-  if (col) col.scrollTo({ top: 0, behavior: 'smooth' });
-  else window.scrollTo({ top: 0, behavior: 'smooth' });
+  // 桌面：.main-col 自身可滚动；窄屏：overflow 放开，滚动落回页面
+  if (col && col.scrollHeight > col.clientHeight + 1) {
+    col.scrollTo({ top: 0, behavior: 'smooth' });
+    return;
+  }
+  const topbar = $('.topbar');
+  const offset = (topbar ? topbar.getBoundingClientRect().height : 0) + 8;
+  const y = pane ? window.scrollY + pane.getBoundingClientRect().top - offset : 0;
+  window.scrollTo({ top: Math.max(0, y), behavior: 'smooth' });
 }
 
 /** 答题页的按钮事件（题号跳转 / 上一题 / 下一题 / 交卷） */
