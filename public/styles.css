@@ -562,7 +562,9 @@ button.danger { color: var(--danger); border-color: #fecaca; }
 
   /* --- 换行与断词：长文案 / 长串不撑破卡片 --- */
   .actions, .side-head, .filters, .review-row, .doc-item, .doc-item .ops { flex-wrap: wrap; }
-  .q-stem, .analysis, .comment, .opt span, .doc-item .n, .history-row .h-title { overflow-wrap: anywhere; }
+  /* .answer-row span 是 flex 子项（min-width: auto）且 white-space: pre-wrap，
+     长代码式答案没有断点，320px 下会撑出卡片 —— 一并允许断词 */
+  .q-stem, .analysis, .comment, .answer-row span, .opt span, .doc-item .n, .history-row .h-title { overflow-wrap: anywhere; }
 
   /* --- 输入字号提到 16px：iOS Safari 聚焦不再自动放大（不禁用缩放） --- */
   .field input, .field select, .field textarea, .spec-row input,
